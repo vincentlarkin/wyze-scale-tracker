@@ -32,6 +32,8 @@ let selectedColumnKeys = new Set(defaultFewColumns);
 
 const statsMetricDefs = [
   { key: "weight_lb", title: "Weight", icon: "fa-weight-scale", digits: 1, suffix: " lb" },
+  { key: "muscle", title: "Muscle", icon: "fa-dumbbell", digits: 1, suffix: " lb" },
+  { key: "muscle_ratio", title: "Muscle/Weight", icon: "fa-percent", digits: 1, suffix: "%" },
   { key: "bmi", title: "BMI", icon: "fa-ruler-vertical", digits: 1, suffix: "" },
   { key: "body_fat", title: "Body Fat", icon: "fa-chart-pie", digits: 1, suffix: "%" },
   { key: "body_water", title: "Body Water", icon: "fa-droplet", digits: 1, suffix: "%" },
@@ -57,6 +59,7 @@ const refs = {
   latestBodyWater: document.getElementById("latestBodyWater"),
   statsPeriod: document.getElementById("statsPeriod"),
   statsGrid: document.getElementById("statsGrid"),
+  matchedInsights: document.getElementById("matchedInsights"),
   rowCount: document.getElementById("rowCount"),
   columnPicker: document.getElementById("columnPicker"),
   presetFew: document.getElementById("presetFew"),
@@ -142,7 +145,7 @@ function renderSummary() {
 
 function metricStats(rows, key) {
   const values = rows
-    .map((row) => row[key])
+    .map((row) => metricValue(row, key))
     .filter((value) => value !== null && value !== undefined)
     .map((value) => Number(value))
     .filter((value) => Number.isFinite(value));
@@ -167,10 +170,112 @@ function metricStats(rows, key) {
   };
 }
 
+function metricValue(row, key) {
+  if (key === "muscle_ratio") {
+    const muscle = Number(row.muscle);
+    const weight = Number(row.weight_lb);
+    if (!Number.isFinite(muscle) || !Number.isFinite(weight) || weight <= 0) return null;
+    return (muscle / weight) * 100;
+  }
+  const value = Number(row[key]);
+  return Number.isFinite(value) ? value : null;
+}
+
+function daysBetween(startTs, endTs) {
+  if (!startTs || !endTs) return null;
+  return Math.round((endTs - startTs) / 86400);
+}
+
+function sameWeightRows(rows, targetWeight, tolerance = 1) {
+  return rows.filter((row) => {
+    const weight = Number(row.weight_lb);
+    return Number.isFinite(weight) && Math.abs(weight - targetWeight) <= tolerance;
+  });
+}
+
+function renderMatchedInsights() {
+  if (!allRows.length) {
+    refs.matchedInsights.innerHTML = "";
+    return;
+  }
+
+  const tolerance = 1.0;
+  const latest = allRows[allRows.length - 1];
+  const latestWeight = Number(latest.weight_lb);
+  if (!Number.isFinite(latestWeight)) {
+    refs.matchedInsights.innerHTML = "";
+    return;
+  }
+
+  const matched = sameWeightRows(allRows, latestWeight, tolerance);
+  const priorMatched = matched.filter((row) => Number(row.measure_ts) < Number(latest.measure_ts));
+  const baseline = priorMatched[0] || null;
+
+  let muscleHtml = `
+    <article class="insight-card">
+      <h3><i class="fa-solid fa-dumbbell"></i> Muscle At Matched Weight</h3>
+      <div class="insight-body">Need at least two readings near ${formatNum(latestWeight, 1)} lb (±${tolerance} lb) to compare.</div>
+    </article>
+  `;
+
+  if (baseline) {
+    const beforeMuscle = Number(baseline.muscle);
+    const nowMuscle = Number(latest.muscle);
+    if (Number.isFinite(beforeMuscle) && Number.isFinite(nowMuscle)) {
+      const delta = nowMuscle - beforeMuscle;
+      const sign = delta > 0 ? "+" : "";
+      const days = daysBetween(Number(baseline.measure_ts), Number(latest.measure_ts));
+      muscleHtml = `
+        <article class="insight-card">
+          <h3><i class="fa-solid fa-dumbbell"></i> Muscle At Matched Weight</h3>
+          <div class="insight-body">
+            Around <b>${formatNum(latestWeight, 1)} lb</b> (±${tolerance} lb), muscle moved from
+            <b>${formatNum(beforeMuscle, 1)} lb</b> (${formatDate(Number(baseline.measure_ts))})
+            to <b>${formatNum(nowMuscle, 1)} lb</b> (${formatDate(Number(latest.measure_ts))}):
+            <b>${sign}${formatNum(delta, 1)} lb</b>${days !== null ? ` over ${days} days` : ""}.
+          </div>
+        </article>
+      `;
+    }
+  }
+
+  let bodyFatHtml = `
+    <article class="insight-card">
+      <h3><i class="fa-solid fa-chart-pie"></i> Body Fat At Matched Weight</h3>
+      <div class="insight-body">No body fat trend available yet at this matched weight range.</div>
+    </article>
+  `;
+
+  const matchedWithBodyFat = matched.filter((row) => Number.isFinite(Number(row.body_fat)));
+  if (matchedWithBodyFat.length) {
+    const sortedByBodyFat = [...matchedWithBodyFat].sort((a, b) => Number(a.body_fat) - Number(b.body_fat));
+    const lowest = sortedByBodyFat[0];
+    const highest = sortedByBodyFat[sortedByBodyFat.length - 1];
+    const currentBodyFat = Number.isFinite(Number(latest.body_fat)) ? Number(latest.body_fat) : null;
+    const currentLine =
+      currentBodyFat === null
+        ? ""
+        : ` Current reading: <b>${formatNum(currentBodyFat, 1)}%</b> (${formatDate(Number(latest.measure_ts))}).`;
+    bodyFatHtml = `
+      <article class="insight-card">
+        <h3><i class="fa-solid fa-chart-pie"></i> Body Fat At Matched Weight</h3>
+        <div class="insight-body">
+          Around <b>${formatNum(latestWeight, 1)} lb</b> (±${tolerance} lb), lowest body fat was
+          <b>${formatNum(lowest.body_fat, 1)}%</b> (${formatDate(Number(lowest.measure_ts))}) and highest was
+          <b>${formatNum(highest.body_fat, 1)}%</b> (${formatDate(Number(highest.measure_ts))}).${currentLine}
+        </div>
+      </article>
+    `;
+  }
+
+  refs.matchedInsights.innerHTML = muscleHtml + bodyFatHtml;
+}
+
 function renderStats() {
   if (!allRows.length) {
     refs.statsPeriod.textContent = "No data in this period";
     refs.statsGrid.innerHTML = "";
+    refs.matchedInsights.innerHTML = "";
     return;
   }
 
@@ -204,6 +309,8 @@ function renderStats() {
       `;
     })
     .join("");
+
+  renderMatchedInsights();
 }
 
 function renderTableHead() {

@@ -194,6 +194,34 @@ button.secondary {
   padding: 1rem;
 }
 
+#statsDetails {
+  width: 100%;
+}
+
+.collapsible-summary {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.8rem;
+  cursor: pointer;
+  list-style: none;
+  font-weight: 700;
+  margin-bottom: 0.9rem;
+}
+
+.collapsible-summary::-webkit-details-marker {
+  display: none;
+}
+
+.summary-title {
+  font-size: 1rem;
+}
+
+.collapsible-content {
+  display: grid;
+  gap: 0.85rem;
+}
+
 .panel-header {
   display: flex;
   justify-content: space-between;
@@ -219,6 +247,12 @@ button.secondary {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
+.matched-grid {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 .stat-card {
   border: 1px solid #e7edf2;
   border-radius: 14px;
@@ -232,6 +266,28 @@ button.secondary {
   display: flex;
   align-items: center;
   gap: 0.4rem;
+}
+
+.insight-card {
+  border: 1px solid #dbe8f2;
+  border-radius: 14px;
+  padding: 0.8rem;
+  background: linear-gradient(180deg, #f5fbff, #fbfdff);
+}
+
+.insight-card h3 {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.42rem;
+  font-size: 0.95rem;
+}
+
+.insight-body {
+  margin-top: 0.4rem;
+  color: #2c3d4b;
+  font-size: 0.9rem;
+  line-height: 1.35;
 }
 
 .stat-values {
@@ -317,6 +373,10 @@ tbody tr:hover {
 
   .stats-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .matched-grid {
+    grid-template-columns: 1fr;
   }
 }
 

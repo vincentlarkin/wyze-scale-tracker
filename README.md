@@ -47,8 +47,10 @@ python app.py
 4. Use **Profile** to filter by person (Wyze profile ID for cloud records, sheet names for imported data).
 5. Use **Export CSV** and choose `day`, `week`, `year`, `all`, or `custom` date range.
 6. Use **Show Few** / **Show All Values** and column chips to customize the Recent Measurements table.
-7. Review the **Period Stats** cards for average, highest, lowest, and change in the selected period.
-8. Use the chart controls to switch metrics and date range.
+7. Expand/collapse **Period Stats** as needed.
+8. Review the stats cards for average, highest, lowest, and change in the selected period.
+9. Check **matched-weight insights** to compare muscle/body-fat changes at roughly the same body weight (±1 lb).
+10. Use the chart controls to switch metrics and date range.
 
 ## Notes
 

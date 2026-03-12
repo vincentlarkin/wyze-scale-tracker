@@ -78,11 +78,16 @@
       </section>
 
       <section class="panel">
-        <div class="panel-header">
-          <h2>Period Stats</h2>
-          <p id="statsPeriod">-</p>
-        </div>
-        <div id="statsGrid" class="stats-grid"></div>
+        <details id="statsDetails" open>
+          <summary class="collapsible-summary">
+            <span class="summary-title">Period Stats</span>
+            <span id="statsPeriod">-</span>
+          </summary>
+          <div class="collapsible-content">
+            <div id="statsGrid" class="stats-grid"></div>
+            <div id="matchedInsights" class="matched-grid"></div>
+          </div>
+        </details>
       </section>
 
       <section class="panel">
