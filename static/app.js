@@ -39,6 +39,18 @@ const statsMetricDefs = [
   { key: "body_water", title: "Body Water", icon: "fa-droplet", digits: 1, suffix: "%" },
 ];
 
+const zeroMeansMissingMetrics = new Set([
+  "muscle",
+  "body_fat",
+  "body_water",
+  "protein",
+  "bone_mineral",
+  "body_vfr",
+  "bmr",
+  "metabolic_age",
+  "muscle_ratio",
+]);
+
 const refs = {
   syncNow: document.getElementById("syncNow"),
   importNow: document.getElementById("importNow"),
@@ -172,13 +184,15 @@ function metricStats(rows, key) {
 
 function metricValue(row, key) {
   if (key === "muscle_ratio") {
-    const muscle = Number(row.muscle);
+    const muscle = metricValue(row, "muscle");
     const weight = Number(row.weight_lb);
-    if (!Number.isFinite(muscle) || !Number.isFinite(weight) || weight <= 0) return null;
+    if (muscle === null || !Number.isFinite(weight) || weight <= 0) return null;
     return (muscle / weight) * 100;
   }
   const value = Number(row[key]);
-  return Number.isFinite(value) ? value : null;
+  if (!Number.isFinite(value)) return null;
+  if (zeroMeansMissingMetrics.has(key) && value === 0) return null;
+  return value;
 }
 
 function daysBetween(startTs, endTs) {
@@ -219,9 +233,9 @@ function renderMatchedInsights() {
   `;
 
   if (baseline) {
-    const beforeMuscle = Number(baseline.muscle);
-    const nowMuscle = Number(latest.muscle);
-    if (Number.isFinite(beforeMuscle) && Number.isFinite(nowMuscle)) {
+    const beforeMuscle = metricValue(baseline, "muscle");
+    const nowMuscle = metricValue(latest, "muscle");
+    if (beforeMuscle !== null && nowMuscle !== null) {
       const delta = nowMuscle - beforeMuscle;
       const sign = delta > 0 ? "+" : "";
       const days = daysBetween(Number(baseline.measure_ts), Number(latest.measure_ts));
@@ -246,12 +260,14 @@ function renderMatchedInsights() {
     </article>
   `;
 
-  const matchedWithBodyFat = matched.filter((row) => Number.isFinite(Number(row.body_fat)));
+  const matchedWithBodyFat = matched.filter((row) => metricValue(row, "body_fat") !== null);
   if (matchedWithBodyFat.length) {
-    const sortedByBodyFat = [...matchedWithBodyFat].sort((a, b) => Number(a.body_fat) - Number(b.body_fat));
+    const sortedByBodyFat = [...matchedWithBodyFat].sort(
+      (a, b) => Number(metricValue(a, "body_fat")) - Number(metricValue(b, "body_fat"))
+    );
     const lowest = sortedByBodyFat[0];
     const highest = sortedByBodyFat[sortedByBodyFat.length - 1];
-    const currentBodyFat = Number.isFinite(Number(latest.body_fat)) ? Number(latest.body_fat) : null;
+    const currentBodyFat = metricValue(latest, "body_fat");
     const currentLine =
       currentBodyFat === null
         ? ""
@@ -261,8 +277,8 @@ function renderMatchedInsights() {
         <h3><i class="fa-solid fa-chart-pie"></i> Body Fat At Matched Weight</h3>
         <div class="insight-body">
           Around <b>${formatNum(latestWeight, 1)} lb</b> (±${tolerance} lb), lowest body fat was
-          <b>${formatNum(lowest.body_fat, 1)}%</b> (${formatDate(Number(lowest.measure_ts))}) and highest was
-          <b>${formatNum(highest.body_fat, 1)}%</b> (${formatDate(Number(highest.measure_ts))}).${currentLine}
+          <b>${formatNum(metricValue(lowest, "body_fat"), 1)}%</b> (${formatDate(Number(lowest.measure_ts))}) and highest was
+          <b>${formatNum(metricValue(highest, "body_fat"), 1)}%</b> (${formatDate(Number(highest.measure_ts))}).${currentLine}
         </div>
       </article>
     `;
