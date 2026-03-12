@@ -45,8 +45,10 @@ python app.py
 2. The app pulls records from Wyze and writes to `data/measurements.db`.
 3. If Wyze sync shows 0 records, click **Import Excel** and upload your Wyze export `.xlsx`.
 4. Use **Profile** to filter by person (Wyze profile ID for cloud records, sheet names for imported data).
-5. Use **Export CSV** and choose `day`, `week`, `year`, or `all`.
-6. Use the chart controls to switch metrics and date range.
+5. Use **Export CSV** and choose `day`, `week`, `year`, `all`, or `custom` date range.
+6. Use **Show Few** / **Show All Values** and column chips to customize the Recent Measurements table.
+7. Review the **Period Stats** cards for average, highest, lowest, and change in the selected period.
+8. Use the chart controls to switch metrics and date range.
 
 ## Notes
 

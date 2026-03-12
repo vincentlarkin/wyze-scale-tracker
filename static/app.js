@@ -3,14 +3,39 @@ const metricLabels = {
   weight_kg: "Weight (kg)",
   bmi: "BMI",
   body_fat: "Body Fat (%)",
-  muscle: "Muscle",
+  muscle: "Muscle (lb)",
   body_water: "Body Water (%)",
   protein: "Protein (%)",
-  bone_mineral: "Bone Mineral",
+  bone_mineral: "Bone Mineral (lb)",
   body_vfr: "Visceral Fat",
   bmr: "BMR",
   metabolic_age: "Metabolic Age",
 };
+
+const tableColumnDefs = [
+  { key: "weight_lb", label: "Weight (lb)", digits: 1 },
+  { key: "weight_kg", label: "Weight (kg)", digits: 1 },
+  { key: "bmi", label: "BMI", digits: 1 },
+  { key: "body_fat", label: "Body Fat %", digits: 1, suffix: "%" },
+  { key: "muscle", label: "Muscle (lb)", digits: 1 },
+  { key: "body_water", label: "Body Water %", digits: 1, suffix: "%" },
+  { key: "protein", label: "Protein %", digits: 1, suffix: "%" },
+  { key: "bone_mineral", label: "Bone Mineral (lb)", digits: 1 },
+  { key: "body_vfr", label: "Visceral Fat", digits: 1 },
+  { key: "bmr", label: "BMR", digits: 0 },
+  { key: "metabolic_age", label: "Metabolic Age", digits: 0 },
+];
+
+const defaultFewColumns = ["weight_lb", "bmi", "body_fat", "muscle", "body_water", "protein"];
+const allColumnKeys = tableColumnDefs.map((column) => column.key);
+let selectedColumnKeys = new Set(defaultFewColumns);
+
+const statsMetricDefs = [
+  { key: "weight_lb", title: "Weight", icon: "fa-weight-scale", digits: 1, suffix: " lb" },
+  { key: "bmi", title: "BMI", icon: "fa-ruler-vertical", digits: 1, suffix: "" },
+  { key: "body_fat", title: "Body Fat", icon: "fa-chart-pie", digits: 1, suffix: "%" },
+  { key: "body_water", title: "Body Water", icon: "fa-droplet", digits: 1, suffix: "%" },
+];
 
 const refs = {
   syncNow: document.getElementById("syncNow"),
@@ -18,6 +43,9 @@ const refs = {
   importFile: document.getElementById("importFile"),
   exportNow: document.getElementById("exportNow"),
   exportRange: document.getElementById("exportRange"),
+  exportCustom: document.getElementById("exportCustom"),
+  exportStart: document.getElementById("exportStart"),
+  exportEnd: document.getElementById("exportEnd"),
   profileSelect: document.getElementById("profileSelect"),
   lookbackDays: document.getElementById("lookbackDays"),
   statusBar: document.getElementById("statusBar"),
@@ -27,7 +55,13 @@ const refs = {
   latestBmi: document.getElementById("latestBmi"),
   latestBodyFat: document.getElementById("latestBodyFat"),
   latestBodyWater: document.getElementById("latestBodyWater"),
+  statsPeriod: document.getElementById("statsPeriod"),
+  statsGrid: document.getElementById("statsGrid"),
   rowCount: document.getElementById("rowCount"),
+  columnPicker: document.getElementById("columnPicker"),
+  presetFew: document.getElementById("presetFew"),
+  presetAll: document.getElementById("presetAll"),
+  tableHead: document.getElementById("recordsHead"),
   tableBody: document.querySelector("#recordsTable tbody"),
   chartCanvas: document.getElementById("trendChart"),
 };
@@ -49,11 +83,32 @@ function formatNum(value, digits = 1) {
   return Number(value).toFixed(digits);
 }
 
+function formatValueByColumn(value, column) {
+  const base = formatNum(value, column.digits ?? 1);
+  if (base === "-") return base;
+  return `${base}${column.suffix || ""}`;
+}
+
 function formatWhen(row) {
   if (!row.measure_ts) {
     return row.measured_at || "-";
   }
   return new Date(row.measure_ts * 1000).toLocaleString();
+}
+
+function formatDate(ts) {
+  if (!ts) return "-";
+  return new Date(ts * 1000).toLocaleDateString();
+}
+
+function selectedProfile() {
+  return (refs.profileSelect.value || "").trim();
+}
+
+function selectedProfileName() {
+  const selected = refs.profileSelect.options[refs.profileSelect.selectedIndex];
+  if (!selected || !selected.value) return "All Profiles";
+  return selected.textContent.replace(/\s+\(\d+\)\s*$/, "");
 }
 
 function profileLabel(row) {
@@ -85,24 +140,122 @@ function renderSummary() {
   refs.latestBodyWater.textContent = `${formatNum(latest.body_water, 1)}%`;
 }
 
+function metricStats(rows, key) {
+  const values = rows
+    .map((row) => row[key])
+    .filter((value) => value !== null && value !== undefined)
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value));
+
+  if (!values.length) {
+    return null;
+  }
+
+  const avg = values.reduce((sum, value) => sum + value, 0) / values.length;
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const first = values[0];
+  const last = values[values.length - 1];
+  const change = last - first;
+
+  return {
+    avg,
+    min,
+    max,
+    change,
+    count: values.length,
+  };
+}
+
+function renderStats() {
+  if (!allRows.length) {
+    refs.statsPeriod.textContent = "No data in this period";
+    refs.statsGrid.innerHTML = "";
+    return;
+  }
+
+  const first = allRows[0];
+  const last = allRows[allRows.length - 1];
+  refs.statsPeriod.textContent = `${selectedProfileName()} | ${formatDate(first.measure_ts)} - ${formatDate(last.measure_ts)} | ${allRows.length} measurements`;
+
+  refs.statsGrid.innerHTML = statsMetricDefs
+    .map((metric) => {
+      const stats = metricStats(allRows, metric.key);
+      if (!stats) {
+        return `
+          <article class="stat-card">
+            <h3><i class="fa-solid ${metric.icon}"></i> ${metric.title}</h3>
+            <div class="stat-values">No values in this period.</div>
+          </article>
+        `;
+      }
+      const sign = stats.change > 0 ? "+" : "";
+      const suffix = metric.suffix || "";
+      return `
+        <article class="stat-card">
+          <h3><i class="fa-solid ${metric.icon}"></i> ${metric.title}</h3>
+          <div class="stat-values">
+            <div><span class="stat-label">Average:</span>${formatNum(stats.avg, metric.digits)}${suffix}</div>
+            <div><span class="stat-label">Highest:</span>${formatNum(stats.max, metric.digits)}${suffix}</div>
+            <div><span class="stat-label">Lowest:</span>${formatNum(stats.min, metric.digits)}${suffix}</div>
+            <div><span class="stat-label">Change:</span>${sign}${formatNum(stats.change, metric.digits)}${suffix}</div>
+          </div>
+        </article>
+      `;
+    })
+    .join("");
+}
+
+function renderTableHead() {
+  const selected = tableColumnDefs.filter((column) => selectedColumnKeys.has(column.key));
+  const columnsHtml = selected.map((column) => `<th>${column.label}</th>`).join("");
+  refs.tableHead.innerHTML = `<tr><th>When</th><th>Profile</th>${columnsHtml}</tr>`;
+}
+
 function renderTable() {
-  const recent = [...allRows].reverse().slice(0, 60);
+  renderTableHead();
+  const selected = tableColumnDefs.filter((column) => selectedColumnKeys.has(column.key));
+  const recent = [...allRows].reverse().slice(0, 80);
   refs.tableBody.innerHTML = "";
   refs.rowCount.textContent = `${allRows.length} rows`;
+
   for (const row of recent) {
+    const dataCells = selected
+      .map((column) => `<td>${formatValueByColumn(row[column.key], column)}</td>`)
+      .join("");
     const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td>${formatWhen(row)}</td>
-      <td>${profileLabel(row)}</td>
-      <td>${formatNum(row.weight_lb, 1)}</td>
-      <td>${formatNum(row.bmi, 1)}</td>
-      <td>${formatNum(row.body_fat, 1)}</td>
-      <td>${formatNum(row.muscle, 1)}</td>
-      <td>${formatNum(row.body_water, 1)}</td>
-      <td>${formatNum(row.protein, 1)}</td>
-    `;
+    tr.innerHTML = `<td>${formatWhen(row)}</td><td>${profileLabel(row)}</td>${dataCells}`;
     refs.tableBody.appendChild(tr);
   }
+}
+
+function renderColumnPicker() {
+  refs.columnPicker.innerHTML = "";
+  for (const column of tableColumnDefs) {
+    const id = `col_${column.key}`;
+    const wrapper = document.createElement("label");
+    wrapper.className = "column-option";
+    wrapper.innerHTML = `<input id="${id}" type="checkbox" ${selectedColumnKeys.has(column.key) ? "checked" : ""} />${column.label}`;
+    const checkbox = wrapper.querySelector("input");
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) {
+        selectedColumnKeys.add(column.key);
+      } else {
+        selectedColumnKeys.delete(column.key);
+      }
+      if (selectedColumnKeys.size === 0) {
+        selectedColumnKeys.add(defaultFewColumns[0]);
+      }
+      renderTable();
+    });
+    refs.columnPicker.appendChild(wrapper);
+  }
+}
+
+function applyColumnPreset(mode) {
+  selectedColumnKeys = new Set(mode === "all" ? allColumnKeys : defaultFewColumns);
+  renderColumnPicker();
+  renderTable();
 }
 
 function renderChart() {
@@ -136,39 +289,25 @@ function renderChart() {
     options: {
       responsive: true,
       maintainAspectRatio: false,
-      animation: {
-        duration: 420,
-      },
-      plugins: {
-        legend: {
-          display: false,
-        },
-      },
+      animation: { duration: 420 },
+      plugins: { legend: { display: false } },
       scales: {
         x: {
-          ticks: {
-            color: "#5b6872",
-            maxTicksLimit: 10,
-          },
-          grid: {
-            color: "rgba(91,104,114,0.1)",
-          },
+          ticks: { color: "#5b6872", maxTicksLimit: 10 },
+          grid: { color: "rgba(91,104,114,0.1)" },
         },
         y: {
-          ticks: {
-            color: "#5b6872",
-          },
-          grid: {
-            color: "rgba(91,104,114,0.1)",
-          },
+          ticks: { color: "#5b6872" },
+          grid: { color: "rgba(91,104,114,0.1)" },
         },
       },
     },
   });
 }
 
-function selectedProfile() {
-  return (refs.profileSelect.value || "").trim();
+function toggleExportCustom() {
+  const isCustom = refs.exportRange.value === "custom";
+  refs.exportCustom.classList.toggle("hidden", !isCustom);
 }
 
 async function fetchProfiles() {
@@ -188,7 +327,7 @@ async function fetchProfiles() {
     option.textContent = `${item.profile_name} (${item.records})`;
     refs.profileSelect.appendChild(option);
   }
-  if (current && profiles.some((p) => p.profile_id === current)) {
+  if (current && profiles.some((profile) => profile.profile_id === current)) {
     refs.profileSelect.value = current;
   }
 }
@@ -197,6 +336,7 @@ async function fetchMeasurements() {
   const days = Number(refs.daysSelect.value);
   const qs = new URLSearchParams();
   qs.set("limit", "5000");
+
   const profile = selectedProfile();
   if (profile) {
     qs.set("profile", profile);
@@ -204,6 +344,7 @@ async function fetchMeasurements() {
   if (Number.isFinite(days) && days > 0) {
     qs.set("days", String(days));
   }
+
   const res = await fetch(`/api/measurements?${qs.toString()}`);
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
@@ -219,6 +360,7 @@ async function refreshUi({ reloadProfiles = false } = {}) {
   }
   await fetchMeasurements();
   renderSummary();
+  renderStats();
   renderTable();
   renderChart();
   if (!allRows.length) {
@@ -298,18 +440,33 @@ async function runImport() {
 }
 
 function runExport() {
+  const range = refs.exportRange.value || "all";
   const qs = new URLSearchParams();
-  qs.set("range", refs.exportRange.value || "all");
+  qs.set("range", range);
+
   const profile = selectedProfile();
   if (profile) {
     qs.set("profile", profile);
   }
+
+  if (range === "custom") {
+    const start = refs.exportStart.value;
+    const end = refs.exportEnd.value;
+    if (!start || !end) {
+      setStatus("Choose both custom start and end dates for export.", "error");
+      return;
+    }
+    qs.set("start", start);
+    qs.set("end", end);
+  }
+
   window.location.href = `/api/export?${qs.toString()}`;
 }
 
 refs.syncNow.addEventListener("click", runSync);
 refs.importNow.addEventListener("click", runImport);
 refs.exportNow.addEventListener("click", runExport);
+refs.exportRange.addEventListener("change", toggleExportCustom);
 refs.metricSelect.addEventListener("change", renderChart);
 refs.daysSelect.addEventListener("change", () => {
   refreshUi().catch((err) => setStatus(`Load error: ${err.message}`, "error"));
@@ -317,5 +474,9 @@ refs.daysSelect.addEventListener("change", () => {
 refs.profileSelect.addEventListener("change", () => {
   refreshUi().catch((err) => setStatus(`Load error: ${err.message}`, "error"));
 });
+refs.presetFew.addEventListener("click", () => applyColumnPreset("few"));
+refs.presetAll.addEventListener("click", () => applyColumnPreset("all"));
 
+toggleExportCustom();
+renderColumnPicker();
 refreshUi({ reloadProfiles: true }).catch((err) => setStatus(`Load error: ${err.message}`, "error"));

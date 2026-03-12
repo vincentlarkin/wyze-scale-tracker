@@ -57,6 +57,7 @@ EXPORT_RANGE_TO_DAYS: dict[str, int | None] = {
     "week": 7,
     "year": 365,
     "all": None,
+    "custom": None,
 }
 
 load_dotenv(BASE_DIR / ".env")
@@ -179,7 +180,13 @@ def _range_to_days(value: str | None) -> int | None:
     return EXPORT_RANGE_TO_DAYS.get(key)
 
 
-def _build_filter_clauses(*, days: int | None = None, profile: str | None = None) -> tuple[str, list[Any]]:
+def _build_filter_clauses(
+    *,
+    days: int | None = None,
+    profile: str | None = None,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
+) -> tuple[str, list[Any]]:
     where: list[str] = []
     params: list[Any] = []
 
@@ -192,8 +199,23 @@ def _build_filter_clauses(*, days: int | None = None, profile: str | None = None
         where.append("profile_id = ?")
         params.append(profile)
 
+    if start_ts is not None:
+        where.append("measure_ts >= ?")
+        params.append(start_ts)
+
+    if end_ts is not None:
+        where.append("measure_ts <= ?")
+        params.append(end_ts)
+
     clause = f" WHERE {' AND '.join(where)} " if where else ""
     return clause, params
+
+
+def _date_to_epoch(date_text: str, *, end_of_day: bool = False) -> int:
+    parsed = datetime.strptime(date_text, "%Y-%m-%d")
+    if end_of_day:
+        parsed = parsed + timedelta(days=1) - timedelta(seconds=1)
+    return int(parsed.timestamp())
 
 
 def _backfill_profile_fields(conn: sqlite3.Connection) -> None:
@@ -734,12 +756,32 @@ def api_latest():
 @app.get("/api/export")
 def api_export():
     range_key = (request.args.get("range") or "all").strip().lower()
-    days = _range_to_days(range_key)
     if range_key not in EXPORT_RANGE_TO_DAYS:
-        return jsonify({"error": "range must be one of: day, week, year, all"}), 400
+        return jsonify({"error": "range must be one of: day, week, year, all, custom"}), 400
 
     profile = (request.args.get("profile") or "").strip() or None
-    where_clause, params = _build_filter_clauses(days=days, profile=profile)
+    days = _range_to_days(range_key)
+    start_ts: int | None = None
+    end_ts: int | None = None
+    if range_key == "custom":
+        start_date = (request.args.get("start") or "").strip()
+        end_date = (request.args.get("end") or "").strip()
+        if not start_date or not end_date:
+            return jsonify({"error": "custom export requires start and end dates (YYYY-MM-DD)"}), 400
+        try:
+            start_ts = _date_to_epoch(start_date, end_of_day=False)
+            end_ts = _date_to_epoch(end_date, end_of_day=True)
+        except ValueError:
+            return jsonify({"error": "invalid custom date format, expected YYYY-MM-DD"}), 400
+        if end_ts < start_ts:
+            return jsonify({"error": "end date must be on or after start date"}), 400
+
+    where_clause, params = _build_filter_clauses(
+        days=days,
+        profile=profile,
+        start_ts=start_ts,
+        end_ts=end_ts,
+    )
 
     query = f"""
         SELECT measured_at, profile_name, profile_id, weight_lb, weight_kg, bmi, body_fat, muscle,

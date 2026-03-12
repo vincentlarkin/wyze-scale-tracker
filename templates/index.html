@@ -10,6 +10,13 @@
       href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&display=swap"
       rel="stylesheet"
     />
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.7.2/css/all.min.css"
+      integrity="sha512-Evv84Mr4kqVGRNSgIGL/F/aIDqQb7xQ2vcrdIwxfjThSH8CSR7PBEakCr51Ck+w+/U6swU2Im1vVX0SVk9ABhg=="
+      crossorigin="anonymous"
+      referrerpolicy="no-referrer"
+    />
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
   </head>
   <body>
@@ -37,7 +44,14 @@
             <option value="week">Week</option>
             <option value="year">Year</option>
             <option value="all" selected>All</option>
+            <option value="custom">Custom</option>
           </select>
+          <div id="exportCustom" class="export-custom hidden">
+            <label for="exportStart">Start</label>
+            <input id="exportStart" type="date" />
+            <label for="exportEnd">End</label>
+            <input id="exportEnd" type="date" />
+          </div>
           <button id="exportNow" type="button" class="secondary">Export CSV</button>
         </div>
       </header>
@@ -46,21 +60,29 @@
 
       <section class="cards" id="summaryCards">
         <article class="card">
-          <h2>Weight</h2>
+          <h2><i class="fa-solid fa-weight-scale"></i> Weight</h2>
           <p id="latestWeight">-</p>
         </article>
         <article class="card">
-          <h2>BMI</h2>
+          <h2><i class="fa-solid fa-ruler-vertical"></i> BMI</h2>
           <p id="latestBmi">-</p>
         </article>
         <article class="card">
-          <h2>Body Fat</h2>
+          <h2><i class="fa-solid fa-chart-pie"></i> Body Fat</h2>
           <p id="latestBodyFat">-</p>
         </article>
         <article class="card">
-          <h2>Body Water</h2>
+          <h2><i class="fa-solid fa-droplet"></i> Body Water</h2>
           <p id="latestBodyWater">-</p>
         </article>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <h2>Period Stats</h2>
+          <p id="statsPeriod">-</p>
+        </div>
+        <div id="statsGrid" class="stats-grid"></div>
       </section>
 
       <section class="panel">
@@ -99,22 +121,16 @@
       <section class="panel">
         <div class="panel-header">
           <h2>Recent Measurements</h2>
-          <p id="rowCount">0 rows</p>
+          <div class="table-controls">
+            <button id="presetFew" type="button" class="secondary">Show Few</button>
+            <button id="presetAll" type="button" class="secondary">Show All Values</button>
+            <p id="rowCount">0 rows</p>
+          </div>
         </div>
+        <div id="columnPicker" class="column-picker"></div>
         <div class="table-wrap">
           <table id="recordsTable">
-            <thead>
-              <tr>
-                <th>When</th>
-                <th>Profile</th>
-                <th>Weight (lb)</th>
-                <th>BMI</th>
-                <th>Body Fat %</th>
-                <th>Muscle</th>
-                <th>Body Water %</th>
-                <th>Protein %</th>
-              </tr>
-            </thead>
+            <thead id="recordsHead"></thead>
             <tbody></tbody>
           </table>
         </div>
