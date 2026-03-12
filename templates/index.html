@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Wyze Scale Tracker</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+  </head>
+  <body>
+    <div class="bg-glow bg-glow-left"></div>
+    <div class="bg-glow bg-glow-right"></div>
+    <main class="container">
+      <header class="topbar">
+        <div>
+          <h1>Wyze Scale Tracker</h1>
+          <p>Pull all weigh-ins, save locally, and track progress over time.</p>
+        </div>
+        <div class="actions">
+          <label for="lookbackDays">Lookback (days)</label>
+          <input id="lookbackDays" type="number" min="1" value="365" />
+          <button id="syncNow" type="button">Sync Now</button>
+          <label for="profileSelect">Profile</label>
+          <select id="profileSelect">
+            <option value="">All Profiles</option>
+          </select>
+          <input id="importFile" type="file" accept=".xlsx,.xlsm,.xltx,.xltm" />
+          <button id="importNow" type="button" class="secondary">Import Excel</button>
+          <label for="exportRange">Export</label>
+          <select id="exportRange">
+            <option value="day">Day</option>
+            <option value="week">Week</option>
+            <option value="year">Year</option>
+            <option value="all" selected>All</option>
+          </select>
+          <button id="exportNow" type="button" class="secondary">Export CSV</button>
+        </div>
+      </header>
+
+      <section id="statusBar" class="status hidden"></section>
+
+      <section class="cards" id="summaryCards">
+        <article class="card">
+          <h2>Weight</h2>
+          <p id="latestWeight">-</p>
+        </article>
+        <article class="card">
+          <h2>BMI</h2>
+          <p id="latestBmi">-</p>
+        </article>
+        <article class="card">
+          <h2>Body Fat</h2>
+          <p id="latestBodyFat">-</p>
+        </article>
+        <article class="card">
+          <h2>Body Water</h2>
+          <p id="latestBodyWater">-</p>
+        </article>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <h2>Trend</h2>
+          <div class="chart-controls">
+            <label for="metricSelect">Metric</label>
+            <select id="metricSelect">
+              <option value="weight_lb">Weight (lb)</option>
+              <option value="weight_kg">Weight (kg)</option>
+              <option value="bmi">BMI</option>
+              <option value="body_fat">Body Fat (%)</option>
+              <option value="muscle">Muscle</option>
+              <option value="body_water">Body Water (%)</option>
+              <option value="protein">Protein (%)</option>
+              <option value="bone_mineral">Bone Mineral</option>
+              <option value="body_vfr">Visceral Fat</option>
+              <option value="bmr">BMR</option>
+              <option value="metabolic_age">Metabolic Age</option>
+            </select>
+            <label for="daysSelect">Range</label>
+            <select id="daysSelect">
+              <option value="30">30d</option>
+              <option value="90">90d</option>
+              <option value="180">180d</option>
+              <option value="365" selected>1y</option>
+              <option value="0">All</option>
+            </select>
+          </div>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="trendChart"></canvas>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <h2>Recent Measurements</h2>
+          <p id="rowCount">0 rows</p>
+        </div>
+        <div class="table-wrap">
+          <table id="recordsTable">
+            <thead>
+              <tr>
+                <th>When</th>
+                <th>Profile</th>
+                <th>Weight (lb)</th>
+                <th>BMI</th>
+                <th>Body Fat %</th>
+                <th>Muscle</th>
+                <th>Body Water %</th>
+                <th>Protein %</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js"></script>
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+</html>
