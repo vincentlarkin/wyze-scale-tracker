@@ -4,13 +4,18 @@ const metricLabels = {
   bmi: "BMI",
   body_fat: "Body Fat (%)",
   muscle: "Muscle (lb)",
+  skeletal_muscle: "Skeletal Muscle (lb)",
   body_water: "Body Water (%)",
   protein: "Protein (%)",
   bone_mineral: "Bone Mineral (lb)",
+  subcutaneous_fat: "Subcutaneous Fat (%)",
   body_vfr: "Visceral Fat",
   bmr: "BMR",
   metabolic_age: "Metabolic Age",
+  body_score: "Body Score",
 };
+
+const AUTO_SYNC_AFTER_SECONDS = 15 * 60;
 
 const tableColumnDefs = [
   { key: "weight_lb", label: "Weight (lb)", digits: 1 },
@@ -18,12 +23,15 @@ const tableColumnDefs = [
   { key: "bmi", label: "BMI", digits: 1 },
   { key: "body_fat", label: "Body Fat %", digits: 1, suffix: "%" },
   { key: "muscle", label: "Muscle (lb)", digits: 1 },
+  { key: "skeletal_muscle", label: "Skeletal Muscle (lb)", digits: 1 },
   { key: "body_water", label: "Body Water %", digits: 1, suffix: "%" },
   { key: "protein", label: "Protein %", digits: 1, suffix: "%" },
   { key: "bone_mineral", label: "Bone Mineral (lb)", digits: 1 },
+  { key: "subcutaneous_fat", label: "Subcutaneous Fat %", digits: 1, suffix: "%" },
   { key: "body_vfr", label: "Visceral Fat", digits: 1 },
   { key: "bmr", label: "BMR", digits: 0 },
   { key: "metabolic_age", label: "Metabolic Age", digits: 0 },
+  { key: "body_score", label: "Body Score", digits: 0 },
 ];
 
 const defaultFewColumns = ["weight_lb", "bmi", "body_fat", "muscle", "body_water", "protein"];
@@ -49,6 +57,9 @@ const zeroMeansMissingMetrics = new Set([
   "bmr",
   "metabolic_age",
   "muscle_ratio",
+  "skeletal_muscle",
+  "subcutaneous_fat",
+  "body_score",
 ]);
 
 const refs = {
@@ -61,8 +72,27 @@ const refs = {
   exportStart: document.getElementById("exportStart"),
   exportEnd: document.getElementById("exportEnd"),
   profileSelect: document.getElementById("profileSelect"),
-  lookbackDays: document.getElementById("lookbackDays"),
   statusBar: document.getElementById("statusBar"),
+  connectionChip: document.getElementById("connectionChip"),
+  connectionText: document.getElementById("connectionText"),
+  connectDialog: document.getElementById("connectDialog"),
+  connectForm: document.getElementById("connectForm"),
+  connectClose: document.getElementById("connectClose"),
+  connectStepCreds: document.getElementById("connectStepCreds"),
+  connectStepCode: document.getElementById("connectStepCode"),
+  connectError: document.getElementById("connectError"),
+  connectSubmit: document.getElementById("connectSubmit"),
+  disconnectBtn: document.getElementById("disconnectBtn"),
+  consoleLink: document.getElementById("consoleLink"),
+  codePrompt: document.getElementById("codePrompt"),
+  cEmail: document.getElementById("cEmail"),
+  cPassword: document.getElementById("cPassword"),
+  cKeyId: document.getElementById("cKeyId"),
+  cApiKey: document.getElementById("cApiKey"),
+  cRemember: document.getElementById("cRemember"),
+  cCode: document.getElementById("cCode"),
+  wyzeSignInBtn: document.getElementById("wyzeSignInBtn"),
+  manualDivider: document.getElementById("manualDivider"),
   metricSelect: document.getElementById("metricSelect"),
   daysSelect: document.getElementById("daysSelect"),
   latestWeight: document.getElementById("latestWeight"),
@@ -89,6 +119,10 @@ function setStatus(message, type = "info") {
   refs.statusBar.classList.remove("hidden", "info", "error");
   refs.statusBar.classList.add(type);
   refs.statusBar.textContent = message;
+}
+
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]);
 }
 
 function formatNum(value, digits = 1) {
@@ -347,7 +381,7 @@ function renderTable() {
       .map((column) => `<td>${formatValueByColumn(row[column.key], column)}</td>`)
       .join("");
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td>${formatWhen(row)}</td><td>${profileLabel(row)}</td>${dataCells}`;
+    tr.innerHTML = `<td>${formatWhen(row)}</td><td>${escapeHtml(profileLabel(row))}</td>${dataCells}`;
     refs.tableBody.appendChild(tr);
   }
 }
@@ -452,8 +486,14 @@ async function fetchProfiles() {
   }
   if (current && profiles.some((profile) => profile.profile_id === current)) {
     refs.profileSelect.value = current;
+  } else if (!profileChosenByUser && profiles.length > 1) {
+    // Mixing people makes the chart/stats meaningless; default to the main profile.
+    const main = [...profiles].sort((a, b) => b.records - a.records)[0];
+    if (main && main.profile_id) refs.profileSelect.value = main.profile_id;
   }
 }
+
+let profileChosenByUser = false;
 
 async function fetchMeasurements() {
   const days = Number(refs.daysSelect.value);
@@ -494,36 +534,210 @@ async function refreshUi({ reloadProfiles = false } = {}) {
   }
 }
 
-async function runSync() {
-  refs.syncNow.disabled = true;
-  const lookback = Math.max(1, Number(refs.lookbackDays.value || "365"));
-  setStatus("Syncing from Wyze...", "info");
+// ---------------------------------------------------------------- Wyze connection
+
+let authState = null;
+let pendingChallenge = null;
+
+// Desktop shell (pywebview) exposes window.pywebview.api.open_wyze_login().
+function desktopApi() {
+  return authState && authState.desktop && window.pywebview && window.pywebview.api && window.pywebview.api.open_wyze_login
+    ? window.pywebview.api
+    : null;
+}
+
+function openWyzeSignIn() {
+  const api = desktopApi();
+  if (!api) return false;
+  if (refs.connectDialog.open) refs.connectDialog.close();
+  api.open_wyze_login();
+  setStatus("Sign in to Wyze in the new window and create an API key. It will close by itself.", "info");
+  return true;
+}
+
+function connectClicked() {
+  if (authState && !authState.connected && !authState.has_saved_credentials && openWyzeSignIn()) return;
+  openConnectDialog();
+}
+
+// After the sign-in window closes, the desktop shell reloads us with the outcome in the URL.
+function consumeConnectParams() {
+  const params = new URLSearchParams(location.search);
+  if (![...params.keys()].length) return null;
+  history.replaceState(null, "", location.pathname);
+  if (params.get("connected")) return { kind: "connected" };
+  if (params.get("challenge")) return { kind: "challenge", id: params.get("challenge"), prompt: params.get("prompt") };
+  if (params.get("connect_error")) return { kind: "error", message: params.get("connect_error") };
+  return null;
+}
+
+async function postJson(url, body = {}) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const payload = await res.json().catch(() => ({}));
+  return { res, payload };
+}
+
+function timeAgo(ts) {
+  if (!ts) return "never";
+  const secs = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+  if (secs < 60) return "just now";
+  if (secs < 3600) return `${Math.floor(secs / 60)} min ago`;
+  if (secs < 86400) return `${Math.floor(secs / 3600)} h ago`;
+  return `${Math.floor(secs / 86400)} d ago`;
+}
+
+function renderConnection() {
+  const chip = refs.connectionChip;
+  chip.classList.remove("ok", "warn");
+  if (!authState) {
+    refs.connectionText.textContent = "Checking…";
+    return;
+  }
+  if (authState.connected || authState.has_saved_credentials) {
+    const expires = authState.api_key_expires;
+    const daysLeft = expires ? Math.floor((expires - Date.now() / 1000) / 86400) : null;
+    const expiring = daysLeft !== null && daysLeft <= 30;
+    chip.classList.add(expiring ? "warn" : "ok");
+    refs.connectionText.textContent = expiring
+      ? daysLeft < 0 ? "Wyze API key expired" : `Wyze key expires in ${daysLeft} d`
+      : `Wyze · synced ${timeAgo(authState.last_sync_at)}`;
+    chip.title =
+      `Connected as ${authState.email || "Wyze account"}.` +
+      (expires ? ` API key valid until ${new Date(expires * 1000).toLocaleDateString()}.` : "") +
+      " Click to manage.";
+  } else {
+    chip.classList.add("warn");
+    refs.connectionText.textContent = "Connect Wyze";
+    chip.title = "Sign in to Wyze to sync your scale";
+  }
+}
+
+async function fetchAuthStatus() {
+  const res = await fetch("/api/auth/status");
+  authState = await res.json();
+  renderConnection();
+  return authState;
+}
+
+function showConnectStep(step) {
+  refs.connectStepCreds.classList.toggle("hidden", step !== "creds");
+  refs.connectStepCode.classList.toggle("hidden", step !== "code");
+  refs.connectSubmit.textContent = step === "code" ? "Verify" : "Connect";
+}
+
+function setConnectError(message) {
+  refs.connectError.textContent = message || "";
+  refs.connectError.classList.toggle("hidden", !message);
+}
+
+function openConnectDialog(reason = "") {
+  pendingChallenge = null;
+  showConnectStep("creds");
+  setConnectError(reason);
+  const state = authState || {};
+  refs.cEmail.value = state.email || "";
+  refs.cKeyId.value = state.saved_key_id || "";
+  refs.cPassword.value = "";
+  refs.cApiKey.value = "";
+  const saved = Boolean(state.has_saved_credentials);
+  refs.cPassword.placeholder = saved ? "Saved (leave blank to keep)" : "";
+  refs.cApiKey.placeholder = saved ? "Saved (leave blank to keep)" : "";
+  if (state.developer_console_url) refs.consoleLink.href = state.developer_console_url;
+  refs.disconnectBtn.classList.toggle("hidden", !state.connected);
+  refs.wyzeSignInBtn.classList.toggle("hidden", !desktopApi());
+  refs.manualDivider.classList.toggle("hidden", !desktopApi());
+  if (!refs.connectDialog.open) refs.connectDialog.showModal();
+  (refs.cEmail.value ? refs.cPassword : refs.cEmail).focus();
+}
+
+async function submitConnect(event) {
+  event.preventDefault();
+  setConnectError("");
+  refs.connectSubmit.disabled = true;
   try {
-    const res = await fetch("/api/sync", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ lookback_days: lookback }),
-    });
-    const payload = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      throw new Error(payload.error || `Sync failed (${res.status})`);
+    let result;
+    if (pendingChallenge) {
+      result = await postJson("/api/auth/verify", {
+        challenge_id: pendingChallenge,
+        code: refs.cCode.value,
+      });
+    } else {
+      result = await postJson("/api/auth/login", {
+        email: refs.cEmail.value,
+        password: refs.cPassword.value,
+        key_id: refs.cKeyId.value,
+        api_key: refs.cApiKey.value,
+        remember_password: refs.cRemember.checked,
+      });
     }
+    const { res, payload } = result;
+    if (!res.ok) throw new Error(payload.error || `Login failed (${res.status})`);
+
+    if (payload.status === "mfa_required") {
+      pendingChallenge = payload.challenge_id;
+      refs.codePrompt.textContent = payload.prompt;
+      refs.cCode.value = "";
+      showConnectStep("code");
+      refs.cCode.focus();
+      return;
+    }
+
+    refs.connectDialog.close();
+    await fetchAuthStatus();
+    await runSync();
+  } catch (err) {
+    setConnectError(err.message);
+  } finally {
+    refs.connectSubmit.disabled = false;
+  }
+}
+
+async function disconnect() {
+  await postJson("/api/auth/logout");
+  refs.connectDialog.close();
+  await fetchAuthStatus();
+  setStatus("Disconnected from Wyze. Cached tokens removed.", "info");
+}
+
+// ---------------------------------------------------------------- sync
+
+let syncing = false;
+
+async function runSync({ quiet = false } = {}) {
+  if (syncing) return;
+  syncing = true;
+  refs.syncNow.disabled = true;
+  refs.syncNow.classList.add("busy");
+  if (!quiet) setStatus("Syncing from Wyze...", "info");
+  try {
+    const { res, payload } = await postJson("/api/sync");
+    if (res.status === 401 && payload.needs_login) {
+      await fetchAuthStatus();
+      setStatus(payload.error, "error");
+      openConnectDialog(payload.error);
+      return;
+    }
+    if (!res.ok) throw new Error(payload.error || `Sync failed (${res.status})`);
+
     const result = payload.result || {};
+    await fetchAuthStatus();
     await refreshUi({ reloadProfiles: true });
-    const errCount = (result.scale_errors || []).length;
-    const modelInfo = (result.models_attempted || []).join(", ");
-    const baseMessage = `Sync complete: ${result.inserted || 0} new / ${result.skipped || 0} existing (${result.records_seen || 0} seen, scales listed: ${result.scales_found || 0}${modelInfo ? `, models: ${modelInfo}` : ""}).`;
-    const hint = (result.hints || [])[0];
-    setStatus(
-      errCount
-        ? `${baseMessage} ${errCount} model call(s) had errors.${hint ? ` ${hint}` : ""}`
-        : `${baseMessage}${hint ? ` ${hint}` : ""}`,
-      errCount ? "error" : "info"
-    );
+    const people = (result.people || [])
+      .map((p) => `${p.name}${p.error ? " (error)" : ` +${p.new}`}`)
+      .join(", ");
+    const errors = result.errors || [];
+    const message = `Sync complete: ${result.inserted || 0} new${people ? ` (${people})` : ""}.`;
+    setStatus(errors.length ? `${message} ${errors[0]}` : message, errors.length ? "error" : "info");
   } catch (err) {
     setStatus(`Sync error: ${err.message}`, "error");
   } finally {
+    syncing = false;
     refs.syncNow.disabled = false;
+    refs.syncNow.classList.remove("busy");
   }
 }
 
@@ -586,7 +800,12 @@ function runExport() {
   window.location.href = `/api/export?${qs.toString()}`;
 }
 
-refs.syncNow.addEventListener("click", runSync);
+refs.syncNow.addEventListener("click", () => runSync());
+refs.connectionChip.addEventListener("click", connectClicked);
+refs.wyzeSignInBtn.addEventListener("click", openWyzeSignIn);
+refs.connectForm.addEventListener("submit", submitConnect);
+refs.connectClose.addEventListener("click", () => refs.connectDialog.close());
+refs.disconnectBtn.addEventListener("click", disconnect);
 refs.importNow.addEventListener("click", runImport);
 refs.exportNow.addEventListener("click", runExport);
 refs.exportRange.addEventListener("change", toggleExportCustom);
@@ -595,11 +814,47 @@ refs.daysSelect.addEventListener("change", () => {
   refreshUi().catch((err) => setStatus(`Load error: ${err.message}`, "error"));
 });
 refs.profileSelect.addEventListener("change", () => {
+  profileChosenByUser = true;
   refreshUi().catch((err) => setStatus(`Load error: ${err.message}`, "error"));
 });
 refs.presetFew.addEventListener("click", () => applyColumnPreset("few"));
 refs.presetAll.addEventListener("click", () => applyColumnPreset("all"));
 
-toggleExportCustom();
-renderColumnPicker();
-refreshUi({ reloadProfiles: true }).catch((err) => setStatus(`Load error: ${err.message}`, "error"));
+async function boot() {
+  const outcome = consumeConnectParams();
+  toggleExportCustom();
+  renderColumnPicker();
+  await refreshUi({ reloadProfiles: true });
+  const state = await fetchAuthStatus();
+
+  if (outcome && outcome.kind === "connected") {
+    setStatus("Connected to Wyze — pulling your history…", "info");
+    await runSync();
+    return;
+  }
+  if (outcome && outcome.kind === "challenge") {
+    openConnectDialog();
+    pendingChallenge = outcome.id;
+    refs.codePrompt.textContent = outcome.prompt || "Enter the verification code.";
+    showConnectStep("code");
+    refs.cCode.focus();
+    return;
+  }
+  if (outcome && outcome.kind === "error") {
+    openConnectDialog(outcome.message);
+    return;
+  }
+
+  const canSync = state.connected || state.has_saved_credentials;
+  if (!canSync) {
+    // Desktop app opens the Wyze sign-in window by itself on first boot.
+    if (!state.desktop) openConnectDialog();
+    else setStatus("Sign in to Wyze in the other window and create an API key — it closes by itself.", "info");
+    return;
+  }
+  const stale = !state.last_sync_at || Date.now() / 1000 - state.last_sync_at > AUTO_SYNC_AFTER_SECONDS;
+  if (stale) await runSync({ quiet: true });
+}
+
+setInterval(renderConnection, 60 * 1000);
+boot().catch((err) => setStatus(`Load error: ${err.message}`, "error"));
