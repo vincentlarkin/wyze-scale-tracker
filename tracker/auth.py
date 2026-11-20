@@ -1,10 +1,9 @@
 """Wyze authentication: one-time login, cached tokens, automatic refresh.
 
-Login happens once (from the web UI, the CLI, or .env credentials). The
-access/refresh tokens are cached in ``data/wyze_session.json`` so later syncs
-never touch the rate-limited login endpoint. When the access token expires it
-is refreshed automatically; only if the refresh also fails do we fall back to
-logging in again with saved credentials.
+Login happens once (desktop capture, web form, CLI, or saved credentials). Tokens
+are kept in the secret store so later syncs never touch the rate-limited login
+endpoint. An expired access token is refreshed automatically; only if the
+refresh fails do we log in again with saved credentials.
 """
 
 from __future__ import annotations
@@ -14,9 +13,9 @@ import os
 import secrets
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Callable, TypeVar
+from typing import Any, TypeVar
 
 import requests
 from dotenv import set_key
@@ -24,23 +23,20 @@ from wyze_sdk import Client, version
 from wyze_sdk.errors import WyzeApiError
 from wyze_sdk.service.auth_service import AuthServiceClient
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-SESSION_PATH = DATA_DIR / "wyze_session.json"
-ENV_PATH = BASE_DIR / ".env"
-AUTH_API = "https://auth-prod.api.wyze.com"
-DEVELOPER_CONSOLE_URL = "https://developer-api-console.wyze.com/#/apikey/view"
+from . import config, secret_store
+
 CHALLENGE_TTL_SECONDS = 600
+TOKEN_KEYS = ("access_token", "refresh_token")
 
 T = TypeVar("T")
 
 
 class NeedsLogin(Exception):
-    """Raised when there is no usable session and no way to log in silently."""
+    """No usable session and no way to log in silently."""
 
 
 class LoginError(Exception):
-    """Raised when Wyze rejects a login attempt; message is user-facing."""
+    """Wyze rejected a login attempt; the message is user-facing."""
 
 
 @dataclass
@@ -60,84 +56,99 @@ _challenges: dict[str, _Challenge] = {}
 _lock = threading.Lock()
 
 
-# --------------------------------------------------------------------------- session file
+# --------------------------------------------------------------------------- session
+
+
+def _read_meta() -> dict[str, Any]:
+    try:
+        return json.loads(config.session_path().read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _write_meta(meta: dict[str, Any]) -> None:
+    path = config.session_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(meta, indent=1), encoding="utf-8")
+    tmp.replace(path)
 
 
 def load_session() -> dict[str, Any] | None:
-    try:
-        data = json.loads(SESSION_PATH.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
-        return None
-    return data if data.get("access_token") and data.get("refresh_token") else None
+    meta = _read_meta()
+    if any(k in meta for k in TOKEN_KEYS):  # migrate tokens out of the plain JSON file
+        for key in TOKEN_KEYS:
+            if meta.get(key):
+                secret_store.set_secret(key, meta[key])
+            meta.pop(key, None)
+        _write_meta(meta)
+    session = dict(meta)
+    for key in TOKEN_KEYS:
+        session[key] = secret_store.get_secret(key)
+    return session if all(session.get(k) for k in TOKEN_KEYS) else None
 
 
 def save_session(**fields: Any) -> dict[str, Any]:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    session = load_session() or {}
-    session.update({k: v for k, v in fields.items() if v is not None})
-    session["updated_at"] = int(time.time())
-    tmp = SESSION_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(session, indent=1), encoding="utf-8")
-    tmp.replace(SESSION_PATH)
-    return session
+    meta = _read_meta()
+    for key in TOKEN_KEYS:
+        value = fields.pop(key, None)
+        if value:
+            secret_store.set_secret(key, value)
+    meta.update({k: v for k, v in fields.items() if v is not None})
+    meta["updated_at"] = int(time.time())
+    _write_meta(meta)
+    return load_session() or meta
 
 
 def clear_session() -> None:
-    SESSION_PATH.unlink(missing_ok=True)
+    for key in TOKEN_KEYS:
+        secret_store.delete_secret(key)
+    config.session_path().unlink(missing_ok=True)
 
 
 # --------------------------------------------------------------------------- credentials
 
 
-def env_credentials() -> dict[str, str | None]:
-    def get(name: str) -> str | None:
-        value = os.getenv(name, "").strip()
-        return value or None
+def saved_credentials() -> dict[str, str | None]:
+    def env(name: str) -> str | None:
+        return os.getenv(name, "").strip() or None
 
     return {
-        "email": get("WYZE_EMAIL"),
-        "password": get("WYZE_PASSWORD"),
-        "key_id": get("WYZE_KEY_ID"),
-        "api_key": get("WYZE_API_KEY"),
-        "totp_key": get("WYZE_TOTP_KEY"),
+        "email": env("WYZE_EMAIL"),
+        "key_id": env("WYZE_KEY_ID"),
+        "password": secret_store.get_secret("WYZE_PASSWORD"),
+        "api_key": secret_store.get_secret("WYZE_API_KEY"),
+        "totp_key": secret_store.get_secret("WYZE_TOTP_KEY"),
     }
 
 
-def _persist_credentials(*, email: str | None, key_id: str, api_key: str, password: str | None) -> None:
-    """Write credentials to .env so a future re-login can happen without asking."""
-    ENV_PATH.touch(exist_ok=True)
-    values = {"WYZE_EMAIL": email, "WYZE_KEY_ID": key_id, "WYZE_API_KEY": api_key, "WYZE_PASSWORD": password}
-    for key, value in values.items():
-        if value is None:
-            continue
-        set_key(str(ENV_PATH), key, value, quote_mode="never")
-        os.environ[key] = value
+def _set_env(name: str, value: str) -> None:
+    path = config.env_path()
+    path.touch(exist_ok=True)
+    set_key(str(path), name, value, quote_mode="never")
+    os.environ[name] = value
 
 
-def save_api_key(*, email: str | None, key_id: str, api_key: str) -> None:
-    """Store a captured API key (and email) without logging in."""
-    _persist_credentials(email=email, key_id=key_id, api_key=api_key, password=None)
+def persist_credentials(
+    *, email: str | None, key_id: str | None, api_key: str | None, password: str | None = None
+) -> None:
+    """Non-secrets to .env, secrets to the secret store."""
+    if email:
+        _set_env("WYZE_EMAIL", email)
+    if key_id:
+        _set_env("WYZE_KEY_ID", key_id)
+    if api_key:
+        secret_store.set_secret("WYZE_API_KEY", api_key)
+    if password:
+        secret_store.set_secret("WYZE_PASSWORD", password)
 
 
 def save_key_expiry(expires: int) -> None:
-    """Remember when the Wyze API key expires (Wyze keys last about a year)."""
-    ENV_PATH.touch(exist_ok=True)
-    set_key(str(ENV_PATH), "WYZE_API_KEY_EXPIRES", str(int(expires)), quote_mode="never")
-    os.environ["WYZE_API_KEY_EXPIRES"] = str(int(expires))
+    """Remember when the Wyze API key expires (keys last about a year)."""
+    _set_env("WYZE_API_KEY_EXPIRES", str(int(expires)))
 
 
 # --------------------------------------------------------------------------- login flow
-
-
-def _auth_headers(auth: AuthServiceClient, nonce: int, key_id: str, api_key: str) -> dict[str, str]:
-    return auth._get_headers(
-        request_specific_headers={
-            "keyid": key_id,
-            "apikey": api_key,
-            "user-agent": f"wyze-scale-tracker (wyze-sdk-{version.__version__})",
-        },
-        nonce=nonce,
-    )
 
 
 def _post_auth(path: str, *, key_id: str, api_key: str, json_body: dict, params: dict | None = None) -> dict:
@@ -145,21 +156,22 @@ def _post_auth(path: str, *, key_id: str, api_key: str, json_body: dict, params:
     nonce = auth.request_verifier.clock.nonce()
     body = dict(json_body)
     body.setdefault("nonce", str(nonce))
+    headers = auth._get_headers(
+        request_specific_headers={
+            "keyid": key_id,
+            "apikey": api_key,
+            "user-agent": f"wyze-scale-tracker (wyze-sdk-{version.__version__})",
+        },
+        nonce=nonce,
+    )
     try:
-        resp = requests.post(
-            f"{AUTH_API}{path}",
-            json=body,
-            params=params,
-            headers=_auth_headers(auth, nonce, key_id, api_key),
-            timeout=20,
-        )
+        resp = requests.post(f"{config.AUTH_API}{path}", json=body, params=params, headers=headers, timeout=20)
     except requests.RequestException as exc:
         raise LoginError(f"Could not reach Wyze: {exc}") from exc
 
     if resp.status_code == 429:
         raise LoginError(
-            "Wyze is rate-limiting logins for this account right now (HTTP 429). "
-            "Wait 10-15 minutes and try again."
+            "Wyze is rate-limiting logins for this account right now (HTTP 429). Wait 10-15 minutes and try again."
         )
     try:
         data = resp.json()
@@ -189,9 +201,7 @@ def _finish(data: dict, *, email: str, key_id: str, api_key: str, password: str,
         email=email,
         logged_in_at=int(time.time()),
     )
-    _persist_credentials(
-        email=email, key_id=key_id, api_key=api_key, password=password if remember_password else None
-    )
+    persist_credentials(email=email, key_id=key_id, api_key=api_key, password=password if remember_password else None)
     return {"status": "ok", "user_id": data.get("user_id")}
 
 
@@ -210,14 +220,11 @@ def start_login(
         raise LoginError("Email, password, Key ID and API Key are all required.")
 
     hashed = _hash_password(password)
-    data = _post_auth(
-        "/api/user/login",
-        key_id=key_id,
-        api_key=api_key,
-        json_body={"email": email, "password": hashed},
-    )
+    data = _post_auth("/api/user/login", key_id=key_id, api_key=api_key, json_body={"email": email, "password": hashed})
     if data.get("access_token"):
-        return _finish(data, email=email, key_id=key_id, api_key=api_key, password=password, remember_password=remember_password)
+        return _finish(
+            data, email=email, key_id=key_id, api_key=api_key, password=password, remember_password=remember_password
+        )
 
     options = data.get("mfa_options") or []
     if "TotpVerificationCode" in options:
@@ -307,9 +314,9 @@ def verify_login(challenge_id: str, code: str) -> dict[str, Any]:
     return _verify(challenge, code)
 
 
-def login_from_env() -> None:
-    """Silent login with .env credentials. Raises NeedsLogin if impossible."""
-    creds = env_credentials()
+def login_with_saved_credentials() -> None:
+    """Silent login with saved credentials. Raises NeedsLogin if impossible."""
+    creds = saved_credentials()
     if not all((creds["email"], creds["password"], creds["key_id"], creds["api_key"])):
         raise NeedsLogin("Not connected to Wyze yet. Click Connect Wyze to sign in.")
     result = start_login(
@@ -329,7 +336,7 @@ def login_from_env() -> None:
 # --------------------------------------------------------------------------- client access
 
 
-def _is_auth_error(exc: Exception) -> bool:
+def is_auth_error(exc: Exception) -> bool:
     if isinstance(exc, WyzeApiError):
         resp = exc.response if isinstance(exc.response, dict) else {}
         code = resp.get("code")
@@ -340,7 +347,7 @@ def _is_auth_error(exc: Exception) -> bool:
     return False
 
 
-def _client_from_session(session: dict[str, Any]) -> Client:
+def make_client(session: dict[str, Any]) -> Client:
     timeout = int(os.getenv("WYZE_TIMEOUT_SECONDS") or 15)
     client = Client(token=session["access_token"], refresh_token=session["refresh_token"], timeout=timeout)
     # wyze-sdk only sets user_id during login(); scale calls need it.
@@ -348,8 +355,8 @@ def _client_from_session(session: dict[str, Any]) -> Client:
     return client
 
 
-def _refresh(session: dict[str, Any]) -> dict[str, Any]:
-    client = _client_from_session(session)
+def refresh(session: dict[str, Any]) -> dict[str, Any]:
+    client = make_client(session)
     client.refresh_token()
     return save_session(
         access_token=client._token,
@@ -358,43 +365,46 @@ def _refresh(session: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-def with_client(fn: Callable[[Client], T]) -> T:
+def with_client[T](fn: Callable[[Client], T]) -> T:
     """Run ``fn`` with an authenticated client, refreshing or re-logging in once if needed."""
     session = load_session()
     if session is None:
-        login_from_env()
+        login_with_saved_credentials()
         session = load_session()
-        assert session is not None
+        if session is None:
+            raise NeedsLogin("Login succeeded but no session was stored.")
 
     try:
-        return fn(_client_from_session(session))
+        return fn(make_client(session))
     except Exception as exc:
-        if not _is_auth_error(exc):
+        if not is_auth_error(exc):
             raise
 
     try:
-        session = _refresh(session)
+        session = refresh(session)
     except Exception:
         clear_session()
-        login_from_env()
+        login_with_saved_credentials()
         session = load_session()
-        assert session is not None
-    return fn(_client_from_session(session))
+        if session is None:
+            raise NeedsLogin("Re-login succeeded but no session was stored.") from None
+    return fn(make_client(session))
 
 
 def status() -> dict[str, Any]:
     session = load_session()
-    creds = env_credentials()
+    creds = saved_credentials()
     try:
         key_expires = int(os.getenv("WYZE_API_KEY_EXPIRES", "") or 0) or None
     except ValueError:
         key_expires = None
     return {
-        "api_key_expires": key_expires,
         "connected": session is not None,
         "email": (session or {}).get("email") or creds["email"],
         "logged_in_at": (session or {}).get("logged_in_at"),
         "has_saved_credentials": all((creds["email"], creds["password"], creds["key_id"], creds["api_key"])),
         "saved_key_id": creds["key_id"],
-        "developer_console_url": DEVELOPER_CONSOLE_URL,
+        "api_key_expires": key_expires,
+        "secret_backend": secret_store.backend_name(),
+        "developer_console_url": config.DEVELOPER_CONSOLE_URL,
     }
