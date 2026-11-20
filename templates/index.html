@@ -29,9 +29,10 @@
           <p>Pull all weigh-ins, save locally, and track progress over time.</p>
         </div>
         <div class="actions">
-          <label for="lookbackDays">Lookback (days)</label>
-          <input id="lookbackDays" type="number" min="1" value="365" />
-          <button id="syncNow" type="button">Sync Now</button>
+          <button id="connectionChip" type="button" class="chip" title="Wyze connection">
+            <span class="dot"></span><span id="connectionText">Checking…</span>
+          </button>
+          <button id="syncNow" type="button"><i class="fa-solid fa-rotate"></i> Sync Now</button>
           <label for="profileSelect">Profile</label>
           <select id="profileSelect">
             <option value="">All Profiles</option>
@@ -101,12 +102,15 @@
               <option value="bmi">BMI</option>
               <option value="body_fat">Body Fat (%)</option>
               <option value="muscle">Muscle</option>
+              <option value="skeletal_muscle">Skeletal Muscle (lb)</option>
               <option value="body_water">Body Water (%)</option>
               <option value="protein">Protein (%)</option>
               <option value="bone_mineral">Bone Mineral</option>
+              <option value="subcutaneous_fat">Subcutaneous Fat (%)</option>
               <option value="body_vfr">Visceral Fat</option>
               <option value="bmr">BMR</option>
               <option value="metabolic_age">Metabolic Age</option>
+              <option value="body_score">Body Score</option>
             </select>
             <label for="daysSelect">Range</label>
             <select id="daysSelect">
@@ -141,6 +145,49 @@
         </div>
       </section>
     </main>
+
+    <dialog id="connectDialog" class="connect-dialog">
+      <form id="connectForm" method="dialog" autocomplete="on">
+        <header class="dialog-head">
+          <h2><i class="fa-solid fa-link"></i> Connect Wyze</h2>
+          <button type="button" class="icon-btn" id="connectClose" aria-label="Close">
+            <i class="fa-solid fa-xmark"></i>
+          </button>
+        </header>
+
+        <div id="connectStepCreds">
+          <button type="button" id="wyzeSignInBtn" class="hidden">
+            <i class="fa-solid fa-arrow-right-to-bracket"></i> Sign in with Wyze (captures your API key automatically)
+          </button>
+          <p id="manualDivider" class="fine hidden">…or enter it manually:</p>
+          <ol class="steps">
+            <li>
+              Open the <a id="consoleLink" href="https://developer-api-console.wyze.com/#/apikey/view" target="_blank" rel="noopener">Wyze developer console</a>,
+              sign in, and click <b>Create an API key</b>.
+            </li>
+            <li>Paste the <b>Key ID</b> and <b>API Key</b> below with your Wyze login.</li>
+          </ol>
+          <label>Wyze email <input id="cEmail" type="email" autocomplete="username" required /></label>
+          <label>Wyze password <input id="cPassword" type="password" autocomplete="current-password" /></label>
+          <label>Key ID <input id="cKeyId" type="text" spellcheck="false" /></label>
+          <label>API Key <input id="cApiKey" type="password" spellcheck="false" /></label>
+          <label class="check"><input id="cRemember" type="checkbox" checked /> Remember password on this computer (allows silent re-login)</label>
+          <p class="fine">Signs in once; after that the app uses a refreshable token stored in <code>data/</code>. Nothing leaves this computer except the request to Wyze.</p>
+        </div>
+
+        <div id="connectStepCode" class="hidden">
+          <p id="codePrompt">Enter the verification code.</p>
+          <label>Code <input id="cCode" type="text" inputmode="numeric" autocomplete="one-time-code" /></label>
+        </div>
+
+        <p id="connectError" class="dialog-error hidden"></p>
+
+        <footer class="dialog-foot">
+          <button type="button" id="disconnectBtn" class="secondary hidden">Disconnect</button>
+          <button type="submit" id="connectSubmit">Connect</button>
+        </footer>
+      </form>
+    </dialog>
 
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js"></script>
     <script src="{{ url_for('static', filename='app.js') }}"></script>

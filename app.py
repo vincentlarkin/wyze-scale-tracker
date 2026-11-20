@@ -7,20 +7,26 @@ import os
 import re
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, render_template, request
 from openpyxl import load_workbook
 from wyze_sdk import Client
+from wyze_sdk.models.devices import DeviceModels
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "measurements.db"
 POUNDS_PER_KG = 2.20462262185
-FALLBACK_MODELS = ("WL_SC2", "WL_SC3", "JA.SC2", "JA.SC")
+# Used only when the device list call fails. The model just picks the backend:
+# JA.SC/JA.SC2 use the original scale service, every newer scale uses "Pluto".
+FALLBACK_MODELS = ("WL_SC2", "JA.SC2")
+FULL_HISTORY_DAYS = 3650
 
 TRACKED_METRICS = (
     "weight_lb",
@@ -28,13 +34,25 @@ TRACKED_METRICS = (
     "bmi",
     "body_fat",
     "muscle",
+    "skeletal_muscle",
     "body_water",
     "protein",
     "bone_mineral",
+    "subcutaneous_fat",
     "body_vfr",
     "bmr",
     "metabolic_age",
+    "body_score",
 )
+
+# Columns added after the original schema: name -> SQL type.
+EXTRA_COLUMNS = {
+    "profile_id": "TEXT",
+    "profile_name": "TEXT",
+    "skeletal_muscle": "REAL",
+    "subcutaneous_fat": "REAL",
+    "body_score": "INTEGER",
+}
 
 EXCEL_HEADER_ALIASES: dict[str, tuple[str, ...]] = {
     "row_number": ("number",),
@@ -50,6 +68,9 @@ EXCEL_HEADER_ALIASES: dict[str, tuple[str, ...]] = {
     "body_vfr": ("visceralfat",),
     "bmr": ("bmr",),
     "metabolic_age": ("metabolicage",),
+    "skeletal_muscle": ("skeletalmuscle", "skeletalmusclemass"),
+    "subcutaneous_fat": ("subcutaneousfat",),
+    "body_score": ("bodyscore",),
 }
 
 EXPORT_RANGE_TO_DAYS: dict[str, int | None] = {
@@ -61,6 +82,9 @@ EXPORT_RANGE_TO_DAYS: dict[str, int | None] = {
 }
 
 load_dotenv(BASE_DIR / ".env")
+
+import wyze_auth  # noqa: E402  (needs .env loaded first)
+
 app = Flask(__name__)
 
 
@@ -86,6 +110,12 @@ def _safe_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _positive(value: Any) -> float | None:
+    """Composition values <= 0 mean 'not measured' (e.g. weight-only readings)."""
+    number = _safe_float(value)
+    return number if number is not None and number > 0 else None
 
 
 def _normalize_epoch_seconds(value: Any) -> int | None:
@@ -276,6 +306,44 @@ def _backfill_profile_fields(conn: sqlite3.Connection) -> None:
         )
 
 
+def _backfill_new_metrics(conn: sqlite3.Connection) -> None:
+    """Fill newly added metric columns from raw_json of previously synced cloud records."""
+    rows = conn.execute(
+        "SELECT id, raw_json FROM measurements WHERE product_model != 'IMPORT_XLSX'"
+    ).fetchall()
+    updates = []
+    for row_id, raw_json in rows:
+        try:
+            raw = json.loads(raw_json) if raw_json else {}
+        except json.JSONDecodeError:
+            continue
+        updates.append(
+            (
+                _kg_to_lb(_positive(raw.get("skeletal_muscle"))),
+                _positive(raw.get("subcutaneous_fat")),
+                _safe_int(raw.get("body_score")),
+                row_id,
+            )
+        )
+    conn.executemany(
+        "UPDATE measurements SET skeletal_muscle = ?, subcutaneous_fat = ?, body_score = ? WHERE id = ?",
+        updates,
+    )
+
+
+def _get_meta(key: str) -> str | None:
+    with _connect() as conn:
+        row = conn.execute("SELECT value FROM app_meta WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def _set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO app_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+
+
 def _ensure_db() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
@@ -308,11 +376,13 @@ def _ensure_db() -> None:
             )
             """
         )
+        conn.execute("CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT)")
         columns = _table_columns(conn, "measurements")
-        if "profile_id" not in columns:
-            conn.execute("ALTER TABLE measurements ADD COLUMN profile_id TEXT")
-        if "profile_name" not in columns:
-            conn.execute("ALTER TABLE measurements ADD COLUMN profile_name TEXT")
+        added = [name for name in EXTRA_COLUMNS if name not in columns]
+        for name in added:
+            conn.execute(f"ALTER TABLE measurements ADD COLUMN {name} {EXTRA_COLUMNS[name]}")
+        if {"skeletal_muscle", "subcutaneous_fat", "body_score"} & set(added):
+            _backfill_new_metrics(conn)
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_measurements_measure_ts
@@ -334,54 +404,30 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
-def _latest_measure_ts(conn: sqlite3.Connection) -> int | None:
-    row = conn.execute("SELECT MAX(measure_ts) AS ts FROM measurements").fetchone()
-    if row is None:
-        return None
-    return _safe_int(row["ts"])
-
-
-def _require_env(name: str) -> str:
-    value = os.getenv(name, "").strip()
-    if not value:
-        raise ValueError(f"Missing required environment variable: {name}")
-    return value
-
-
-def _make_client() -> Client:
-    email = _require_env("WYZE_EMAIL")
-    password = _require_env("WYZE_PASSWORD")
-    key_id = _require_env("WYZE_KEY_ID")
-    api_key = _require_env("WYZE_API_KEY")
-    totp_key = os.getenv("WYZE_TOTP_KEY", "").strip() or None
-    timeout = _safe_int(os.getenv("WYZE_TIMEOUT_SECONDS")) or 15
-    return Client(
-        email=email,
-        password=password,
-        key_id=key_id,
-        api_key=api_key,
-        totp_key=totp_key,
-        timeout=timeout,
-    )
+def _latest_cloud_ts(conn: sqlite3.Connection, profile_id: str | None) -> int | None:
+    query = "SELECT MAX(measure_ts) AS ts FROM measurements WHERE product_model != 'IMPORT_XLSX'"
+    params: list[Any] = []
+    if profile_id:
+        query += " AND profile_id = ?"
+        params.append(profile_id)
+    row = conn.execute(query, params).fetchone()
+    return _safe_int(row["ts"]) if row else None
 
 
 def _measurement_payload(
     record: Any,
     *,
     product_model: str,
-    scale_mac: str | None = None,
-    profile_name_map: dict[str, str] | None = None,
+    profile_id: str | None = None,
+    profile_name: str | None = None,
 ) -> dict[str, Any]:
     raw = record.to_dict()
 
     measure_ts = _normalize_epoch_seconds(raw.get("measure_ts"))
-    measured_at = datetime.fromtimestamp(measure_ts).isoformat() if measure_ts else datetime.utcnow().isoformat()
-    resolved_scale_mac = str(scale_mac or raw.get("mac") or f"model:{product_model}")
+    measured_at = datetime.fromtimestamp(measure_ts).isoformat() if measure_ts else datetime.now().isoformat()
+    resolved_scale_mac = str(raw.get("mac") or f"model:{product_model}")
     record_id = str(raw.get("id") or raw.get("data_id") or f"{resolved_scale_mac}-{measure_ts or 'na'}")
-    profile_id = str(raw.get("family_member_id") or raw.get("user_id") or "")
-    if profile_id == "":
-        profile_id = None
-    profile_name = profile_name_map.get(profile_id) if (profile_id and profile_name_map) else None
+    profile_id = str(raw.get("family_member_id") or raw.get("user_id") or profile_id or "") or None
 
     # wyze-sdk returns `weight` in lb while internal `_weight` is kg.
     weight_lb = _safe_float(raw.get("weight"))
@@ -415,7 +461,11 @@ def _measurement_payload(
         "body_vfr": _safe_float(raw.get("body_vfr")),
         "bmr": _safe_float(raw.get("bmr")),
         "metabolic_age": _safe_int(raw.get("metabolic_age")),
-        "raw_json": json.dumps(raw, separators=(",", ":"), sort_keys=True),
+        # Scale Ultra / BodyScan extras (skeletal muscle is kg in the API).
+        "skeletal_muscle": _kg_to_lb(_positive(raw.get("skeletal_muscle"))),
+        "subcutaneous_fat": _positive(raw.get("subcutaneous_fat")),
+        "body_score": _safe_int(raw.get("body_score")),
+        "raw_json": json.dumps(raw, separators=(",", ":"), sort_keys=True, default=str),
     }
 
 
@@ -459,6 +509,9 @@ def _payload_from_import_row(
         "body_vfr": _strip_numeric(row_data.get("body_vfr")),
         "bmr": _strip_numeric(row_data.get("bmr")),
         "metabolic_age": _safe_int(_strip_numeric(row_data.get("metabolic_age"))),
+        "skeletal_muscle": _strip_numeric(row_data.get("skeletal_muscle")),
+        "subcutaneous_fat": _strip_numeric(row_data.get("subcutaneous_fat")),
+        "body_score": _safe_int(_strip_numeric(row_data.get("body_score"))),
         "raw_json": json.dumps(
             {"source": "xlsx", "sheet": sheet_name, "row_index": row_index, "row": row_data},
             separators=(",", ":"),
@@ -490,12 +543,14 @@ def _upsert_measurement(conn: sqlite3.Connection, payload: dict[str, Any]) -> bo
             record_id, scale_mac, device_id, product_model, measured_at, measure_ts,
             profile_id, profile_name,
             weight_lb, weight_kg, bmi, body_fat, muscle, body_water, protein,
-            bone_mineral, body_vfr, bmr, metabolic_age, raw_json
+            bone_mineral, body_vfr, bmr, metabolic_age,
+            skeletal_muscle, subcutaneous_fat, body_score, raw_json
         ) VALUES (
             :record_id, :scale_mac, :device_id, :product_model, :measured_at, :measure_ts,
             :profile_id, :profile_name,
             :weight_lb, :weight_kg, :bmi, :body_fat, :muscle, :body_water, :protein,
-            :bone_mineral, :body_vfr, :bmr, :metabolic_age, :raw_json
+            :bone_mineral, :body_vfr, :bmr, :metabolic_age,
+            :skeletal_muscle, :subcutaneous_fat, :body_score, :raw_json
         )
         """,
         payload,
@@ -568,111 +623,157 @@ def import_from_excel(file_bytes: bytes, *, filename: str = "upload.xlsx", sheet
         "sheets_processed": len(sheets),
         "sheet_summaries": sheet_summaries,
         "parse_errors": parse_errors[:20],
-        "imported_at": datetime.utcnow().isoformat() + "Z",
+        "imported_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
 
 
-def sync_from_wyze(*, lookback_days: int = 365) -> dict[str, Any]:
-    client = _make_client()
-    profile_name_map: dict[str, str] = {}
-    skip_scale_list = os.getenv("WYZE_SKIP_SCALE_LIST", "true").strip().lower() == "true"
+def _service_key(model: str) -> str:
+    return "scale" if model in DeviceModels.SCALE_ else "pluto"
 
-    scales: list[Any] = []
-    scale_list_error: str | None = None
-    if not skip_scale_list:
+
+def _owner_display_name(client: Client, fallback: str | None) -> str:
+    if fallback and "@" not in fallback:
+        return fallback
+    try:
+        info = client.user_get_info().data.get("data") or {}
+        nickname = str(info.get("nickname") or "").strip()
+        if nickname and "@" not in nickname:
+            return nickname
+    except Exception:
+        pass
+    return "Me"
+
+
+def _discover_sync_targets(client: Client) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    """Find scales and every family member on them.
+
+    Returns (scales, targets, errors). Each target is one person to pull records for.
+    """
+    errors: list[str] = []
+    scales: list[dict[str, Any]] = []
+    try:
+        for scale in client.scales.list():
+            scales.append(
+                {
+                    "mac": scale.mac,
+                    "model": scale.product.model if scale.product else None,
+                    "nickname": scale.nickname,
+                }
+            )
+    except Exception as exc:
+        errors.append(f"Scale list failed ({exc}); falling back to direct queries.")
+
+    targets: dict[tuple[str, str | None], dict[str, Any]] = {}
+    for scale in scales:
+        model = scale["model"] or FALLBACK_MODELS[0]
+        members: list[dict[str, Any]] = []
         try:
-            scales = list(client.scales.list())
+            response = client.scales._scale_client(model).get_family_member(did=scale["mac"])
+            members = (response.data or {}).get("data") or []
         except Exception as exc:
-            scale_list_error = str(exc)
+            errors.append(f"{scale['nickname'] or scale['mac']}: could not list family members ({exc})")
 
-    scale_descriptors = [
-        {
-            "mac": scale.mac,
-            "model": scale.product.model if scale.product else None,
-            "nickname": scale.nickname,
-        }
-        for scale in scales
-    ]
-
-    now = datetime.now()
-    with _connect() as conn:
-        latest_ts = _latest_measure_ts(conn)
-        start_time = now - timedelta(days=lookback_days)
-        if latest_ts:
-            start_time = datetime.fromtimestamp(latest_ts) - timedelta(days=2)
-        for profile_id, profile_name in profile_name_map.items():
-            conn.execute(
-                """
-                UPDATE measurements
-                SET profile_name = ?
-                WHERE profile_id = ? AND (profile_name IS NULL OR profile_name = '')
-                """,
-                (profile_name, profile_id),
+        if not members:
+            targets.setdefault((_service_key(model), None), {"model": model, "profile_id": None, "name": None})
+        for member in members:
+            member_id = str(member.get("id") or "") or None
+            if member_id is None:
+                continue
+            name = str(member.get("nick_name") or "").strip() or None
+            if member_id == client._user_id:
+                name = _owner_display_name(client, name)
+            targets.setdefault(
+                (_service_key(model), member_id),
+                {"model": model, "profile_id": member_id, "name": name, "scale": scale["nickname"]},
             )
 
+    if not scales:
+        for model in FALLBACK_MODELS:
+            targets.setdefault((_service_key(model), None), {"model": model, "profile_id": None, "name": None})
+
+    return scales, list(targets.values()), errors
+
+
+def sync_from_wyze(*, full: bool = False) -> dict[str, Any]:
+    """Pull new scale records for every person on every scale.
+
+    Incremental by default: each person is fetched from their newest stored record
+    (minus a 2-day overlap). The first sync for a person, or ``full=True``, pulls
+    the complete history.
+    """
+
+    def run(client: Client) -> dict[str, Any]:
+        scales, targets, errors = _discover_sync_targets(client)
+        now = datetime.now()
         result = DbResult()
         records_seen = 0
-        scale_errors: list[str] = []
-        records_by_model: dict[str, int] = {}
+        people: list[dict[str, Any]] = []
 
-        listed_models = [item["model"] for item in scale_descriptors if item.get("model")]
-        models_attempted = list(dict.fromkeys(listed_models or list(FALLBACK_MODELS)))
-        fallback_used = len(listed_models) == 0
-
-        for model in models_attempted:
-            try:
-                records = client.scales.get_records(
-                    device_model=model,
-                    start_time=start_time,
-                    end_time=now,
+        with _connect() as conn:
+            for target in targets:
+                profile_id = target["profile_id"]
+                latest = None if full else _latest_cloud_ts(conn, profile_id)
+                start = (
+                    datetime.fromtimestamp(latest) - timedelta(days=2)
+                    if latest
+                    else now - timedelta(days=FULL_HISTORY_DAYS)
                 )
-            except Exception as exc:
-                records_by_model[model] = 0
-                scale_errors.append(f"{model}: {exc}")
-                continue
+                label = target["name"] or profile_id or target["model"]
+                try:
+                    records = client.scales.get_records(
+                        device_model=target["model"], user_id=profile_id, start_time=start, end_time=now
+                    )
+                except Exception as exc:
+                    errors.append(f"{label}: {exc}")
+                    people.append({"name": label, "profile_id": profile_id, "fetched": 0, "new": 0, "error": True})
+                    continue
 
-            records_by_model[model] = len(records)
-            for record in records:
-                records_seen += 1
-                payload = _measurement_payload(
-                    record,
-                    product_model=model,
-                    profile_name_map=profile_name_map,
+                new_for_person = 0
+                for record in records:
+                    records_seen += 1
+                    payload = _measurement_payload(
+                        record,
+                        product_model=target["model"],
+                        profile_id=profile_id,
+                        profile_name=target["name"],
+                    )
+                    if _upsert_measurement(conn, payload):
+                        result.inserted += 1
+                        new_for_person += 1
+                    else:
+                        result.skipped += 1
+
+                if profile_id and target["name"]:
+                    conn.execute(
+                        "UPDATE measurements SET profile_name = ? WHERE profile_id = ? AND product_model != 'IMPORT_XLSX'",
+                        (target["name"], profile_id),
+                    )
+                people.append(
+                    {
+                        "name": label,
+                        "profile_id": profile_id,
+                        "fetched": len(records),
+                        "new": new_for_person,
+                        "since": start.date().isoformat(),
+                    }
                 )
-                if _upsert_measurement(conn, payload):
-                    result.inserted += 1
-                else:
-                    result.skipped += 1
 
-            # Avoid calling the same endpoint variants repeatedly when device listing is empty.
-            if fallback_used and records:
-                break
+            summary = {
+                "inserted": result.inserted,
+                "skipped": result.skipped,
+                "records_seen": records_seen,
+                "scales": scales,
+                "people": people,
+                "errors": errors,
+                "full": full,
+                "synced_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            }
+            _set_meta(conn, "last_sync_at", str(int(now.timestamp())))
+            _set_meta(conn, "last_sync_result", json.dumps(summary))
+            conn.commit()
+        return summary
 
-        conn.commit()
-
-    hints: list[str] = []
-    if skip_scale_list:
-        hints.append("Device list step skipped; using direct model queries for faster/more reliable sync.")
-    if not scales and records_seen > 0:
-        hints.append("Scale list endpoint returned 0 devices, but fallback model query returned records.")
-    if records_seen == 0:
-        hints.append("Wyze returned no records. If export has data, use Import Excel and keep Sync for future checks.")
-
-    return {
-        "inserted": result.inserted,
-        "skipped": result.skipped,
-        "records_seen": records_seen,
-        "scales_found": len(scales),
-        "scales_listed": scale_descriptors,
-        "models_attempted": models_attempted,
-        "records_by_model": records_by_model,
-        "fallback_used": fallback_used,
-        "scale_errors": scale_errors,
-        "scale_list_error": scale_list_error,
-        "hints": hints,
-        "lookback_days": lookback_days,
-        "synced_at": datetime.utcnow().isoformat() + "Z",
-    }
+    return wyze_auth.with_client(run)
 
 
 def _rows_to_dicts(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
@@ -691,18 +792,50 @@ def index() -> str:
     return render_template("index.html")
 
 
+MEASUREMENT_COLUMNS = (
+    "id, record_id, scale_mac, device_id, product_model, profile_id, profile_name, measured_at, measure_ts, "
+    + ", ".join(TRACKED_METRICS)
+)
+
+EXPORT_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("measured_at", "measured_at"),
+    ("profile_name", "profile_name"),
+    ("profile_id", "profile_id"),
+    ("weight_lb", "weight_lb"),
+    ("weight_kg", "weight_kg"),
+    ("bmi", "bmi"),
+    ("body_fat", "body_fat"),
+    ("muscle", "muscle_lb"),
+    ("skeletal_muscle", "skeletal_muscle_lb"),
+    ("body_water", "body_water"),
+    ("protein", "protein"),
+    ("bone_mineral", "bone_mineral_lb"),
+    ("subcutaneous_fat", "subcutaneous_fat"),
+    ("body_vfr", "body_vfr"),
+    ("bmr", "bmr"),
+    ("metabolic_age", "metabolic_age"),
+    ("body_score", "body_score"),
+    ("product_model", "product_model"),
+)
+
+
+@app.before_request
+def _same_origin_only():
+    """Block cross-site POSTs (e.g. a random web page posting to localhost)."""
+    if request.method == "POST":
+        origin = request.headers.get("Origin")
+        if origin and urlparse(origin).netloc != request.host:
+            return jsonify({"error": "Cross-origin request blocked"}), 403
+    return None
+
+
 @app.get("/api/measurements")
 def api_measurements():
     limit = min(max(request.args.get("limit", type=int, default=500), 1), 5000)
     days = request.args.get("days", type=int)
     profile = (request.args.get("profile") or "").strip() or None
 
-    inner_query = """
-        SELECT id, record_id, scale_mac, device_id, product_model, profile_id, profile_name, measured_at, measure_ts,
-               weight_lb, weight_kg, bmi, body_fat, muscle, body_water, protein,
-               bone_mineral, body_vfr, bmr, metabolic_age
-        FROM measurements
-    """
+    inner_query = f"SELECT {MEASUREMENT_COLUMNS} FROM measurements"
     where_clause, params = _build_filter_clauses(days=days, profile=profile)
     inner_query += where_clause
     inner_query += " ORDER BY measure_ts DESC LIMIT ?"
@@ -722,11 +855,11 @@ def api_profiles():
             """
             SELECT
                 profile_id,
-                COALESCE(NULLIF(profile_name, ''), NULLIF(profile_id, ''), 'Unknown') AS profile_name,
+                COALESCE(MAX(NULLIF(profile_name, '')), NULLIF(profile_id, ''), 'Unknown') AS profile_name,
                 COUNT(*) AS records,
                 MAX(measure_ts) AS latest_ts
             FROM measurements
-            GROUP BY profile_id, COALESCE(NULLIF(profile_name, ''), NULLIF(profile_id, ''), 'Unknown')
+            GROUP BY profile_id
             ORDER BY latest_ts DESC
             """
         ).fetchall()
@@ -740,14 +873,7 @@ def api_latest():
     where_clause, params = _build_filter_clauses(profile=profile)
     with _connect() as conn:
         row = conn.execute(
-            f"""
-            SELECT id, record_id, profile_id, profile_name, measured_at, measure_ts, weight_lb, weight_kg, bmi,
-                   body_fat, muscle, body_water, protein, bone_mineral, body_vfr, bmr, metabolic_age
-            FROM measurements
-            {where_clause}
-            ORDER BY measure_ts DESC
-            LIMIT 1
-            """,
+            f"SELECT {MEASUREMENT_COLUMNS} FROM measurements {where_clause} ORDER BY measure_ts DESC LIMIT 1",
             params,
         ).fetchone()
     return jsonify({"data": dict(row) if row else None})
@@ -776,69 +902,22 @@ def api_export():
         if end_ts < start_ts:
             return jsonify({"error": "end date must be on or after start date"}), 400
 
-    where_clause, params = _build_filter_clauses(
-        days=days,
-        profile=profile,
-        start_ts=start_ts,
-        end_ts=end_ts,
-    )
-
-    query = f"""
-        SELECT measured_at, profile_name, profile_id, weight_lb, weight_kg, bmi, body_fat, muscle,
-               body_water, protein, bone_mineral, body_vfr, bmr, metabolic_age, product_model
-        FROM measurements
-        {where_clause}
-        ORDER BY measure_ts ASC
-    """
+    where_clause, params = _build_filter_clauses(days=days, profile=profile, start_ts=start_ts, end_ts=end_ts)
+    select_cols = ", ".join(col for col, _ in EXPORT_COLUMNS)
+    query = f"SELECT {select_cols} FROM measurements {where_clause} ORDER BY measure_ts ASC"
 
     with _connect() as conn:
         rows = conn.execute(query, params).fetchall()
 
     stream = io.StringIO()
     writer = csv.writer(stream)
-    writer.writerow(
-        [
-            "measured_at",
-            "profile_name",
-            "profile_id",
-            "weight_lb",
-            "weight_kg",
-            "bmi",
-            "body_fat",
-            "muscle_lb",
-            "body_water",
-            "protein",
-            "bone_mineral_lb",
-            "body_vfr",
-            "bmr",
-            "metabolic_age",
-            "product_model",
-        ]
-    )
+    writer.writerow([header for _, header in EXPORT_COLUMNS])
     for row in rows:
-        writer.writerow(
-            [
-                row["measured_at"],
-                row["profile_name"],
-                row["profile_id"],
-                row["weight_lb"],
-                row["weight_kg"],
-                row["bmi"],
-                row["body_fat"],
-                row["muscle"],
-                row["body_water"],
-                row["protein"],
-                row["bone_mineral"],
-                row["body_vfr"],
-                row["bmr"],
-                row["metabolic_age"],
-                row["product_model"],
-            ]
-        )
+        writer.writerow([row[col] for col, _ in EXPORT_COLUMNS])
 
     filename_parts = ["wyze-scale-export", range_key]
     if profile:
-        filename_parts.append(profile.replace(":", "_"))
+        filename_parts.append(re.sub(r"[^A-Za-z0-9_-]+", "_", profile))
     filename_parts.append(datetime.now().strftime("%Y%m%d-%H%M%S"))
     filename = "-".join(filename_parts) + ".csv"
 
@@ -849,17 +928,57 @@ def api_export():
     )
 
 
+@app.get("/api/auth/status")
+def api_auth_status():
+    info = wyze_auth.status()
+    last_sync = _get_meta("last_sync_at")
+    info["last_sync_at"] = int(last_sync) if last_sync else None
+    info["desktop"] = bool(app.config.get("DESKTOP"))
+    return jsonify(info)
+
+
+@app.post("/api/auth/login")
+def api_auth_login():
+    body = request.get_json(silent=True) or {}
+    creds = wyze_auth.env_credentials()
+    try:
+        result = wyze_auth.start_login(
+            email=str(body.get("email") or creds["email"] or ""),
+            # A blank password/API key in the form means "use the saved one".
+            password=str(body.get("password") or creds["password"] or ""),
+            key_id=str(body.get("key_id") or creds["key_id"] or ""),
+            api_key=str(body.get("api_key") or creds["api_key"] or ""),
+            totp_key=creds["totp_key"],
+            remember_password=bool(body.get("remember_password", True)),
+        )
+    except wyze_auth.LoginError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify(result)
+
+
+@app.post("/api/auth/verify")
+def api_auth_verify():
+    body = request.get_json(silent=True) or {}
+    try:
+        result = wyze_auth.verify_login(str(body.get("challenge_id") or ""), str(body.get("code") or ""))
+    except wyze_auth.LoginError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify(result)
+
+
+@app.post("/api/auth/logout")
+def api_auth_logout():
+    wyze_auth.clear_session()
+    return jsonify({"ok": True})
+
+
 @app.post("/api/sync")
 def api_sync():
     body = request.get_json(silent=True) or {}
-    lookback_days = body.get("lookback_days", 365)
     try:
-        lookback_days = max(1, int(lookback_days))
-    except (TypeError, ValueError):
-        return jsonify({"error": "lookback_days must be an integer"}), 400
-
-    try:
-        result = sync_from_wyze(lookback_days=lookback_days)
+        result = sync_from_wyze(full=bool(body.get("full")))
+    except (wyze_auth.NeedsLogin, wyze_auth.LoginError) as exc:
+        return jsonify({"error": str(exc), "needs_login": True}), 401
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
     return jsonify({"ok": True, "result": result})
@@ -889,8 +1008,122 @@ def create_app() -> Flask:
 create_app()
 
 
-if __name__ == "__main__":
+# --------------------------------------------------------------------------- CLI
+
+
+def _cli_login() -> int:
+    import getpass
+
+    creds = wyze_auth.env_credentials()
+
+    def ask(label: str, current: str | None, secret: bool = False) -> str:
+        hint = " [saved, Enter to keep]" if current else ""
+        prompt = f"{label}{hint}: "
+        value = getpass.getpass(prompt) if secret else input(prompt)
+        return value.strip() or (current or "")
+
+    print(f"Get a Key ID + API Key at {wyze_auth.DEVELOPER_CONSOLE_URL}")
+    try:
+        result = wyze_auth.start_login(
+            email=ask("Wyze email", creds["email"]),
+            password=ask("Wyze password", creds["password"], secret=True),
+            key_id=ask("Key ID", creds["key_id"]),
+            api_key=ask("API Key", creds["api_key"], secret=True),
+            totp_key=creds["totp_key"],
+        )
+        if result["status"] == "mfa_required":
+            result = wyze_auth.verify_login(result["challenge_id"], input(result["prompt"] + " "))
+    except wyze_auth.LoginError as exc:
+        print(f"Login failed: {exc}")
+        return 1
+    print("Connected. Tokens cached in data/wyze_session.json; credentials saved to .env.")
+    return 0
+
+
+def _cli_sync(full: bool) -> int:
+    try:
+        result = sync_from_wyze(full=full)
+    except (wyze_auth.NeedsLogin, wyze_auth.LoginError) as exc:
+        print(f"{exc}\nRun: python app.py login")
+        return 1
+    for person in result["people"]:
+        print(f"  {person['name']}: {person['new']} new / {person['fetched']} fetched")
+    for error in result["errors"]:
+        print(f"  ! {error}")
+    print(f"Sync complete: {result['inserted']} new, {result['skipped']} already stored.")
+    return 0
+
+
+def _cli_status() -> int:
+    info = wyze_auth.status()
+    last = _get_meta("last_sync_at")
+    print(f"Connected: {info['connected']} ({info['email'] or 'no account'})")
+    print(f"Saved credentials for silent re-login: {info['has_saved_credentials']}")
+    if info["api_key_expires"]:
+        print(f"API key expires: {datetime.fromtimestamp(info['api_key_expires']):%Y-%m-%d}")
+    print(f"Last sync: {datetime.fromtimestamp(int(last)).isoformat(sep=' ') if last else 'never'}")
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT COALESCE(MAX(profile_name), profile_id) AS name, COUNT(*) AS n, MAX(measure_ts) AS ts
+            FROM measurements GROUP BY profile_id ORDER BY ts DESC
+            """
+        ).fetchall()
+    for row in rows:
+        print(f"  {row['name']}: {row['n']} records, latest {datetime.fromtimestamp(row['ts']):%Y-%m-%d %H:%M}")
+    return 0
+
+
+def _serve(open_browser: bool) -> None:
     host = os.getenv("APP_HOST", "127.0.0.1")
     port = int(os.getenv("APP_PORT", "8000"))
     debug = os.getenv("APP_DEBUG", "false").lower() == "true"
+    if open_browser and os.environ.get("WERKZEUG_RUN_MAIN") != "true":
+        import threading
+        import webbrowser
+
+        threading.Timer(1.0, webbrowser.open, args=(f"http://{host}:{port}",)).start()
     app.run(host=host, port=port, debug=debug)
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Wyze Scale Tracker")
+    sub = parser.add_subparsers(dest="command")
+    desk = sub.add_parser("desktop", help="Open the desktop app (default)")
+    desk.add_argument("--reconnect", action="store_true", help="Open the Wyze sign-in window to capture a new API key")
+    serve = sub.add_parser("serve", help="Run as a web server for your normal browser")
+    serve.add_argument("--no-browser", action="store_true", help="Don't open a browser tab")
+    sub.add_parser("login", help="Connect your Wyze account (handles 2FA)")
+    sync = sub.add_parser("sync", help="Pull new scale records")
+    sync.add_argument("--full", action="store_true", help="Re-fetch complete history")
+    sub.add_parser("status", help="Show connection and data summary")
+    sub.add_parser("logout", help="Forget cached Wyze tokens")
+    args = parser.parse_args(argv)
+
+    if args.command == "login":
+        return _cli_login()
+    if args.command == "sync":
+        return _cli_sync(args.full)
+    if args.command == "status":
+        return _cli_status()
+    if args.command == "logout":
+        wyze_auth.clear_session()
+        print("Cached Wyze tokens removed.")
+        return 0
+    if args.command == "serve":
+        _serve(open_browser=not args.no_browser)
+        return 0
+    try:
+        import desktop
+    except ImportError as exc:
+        print(f"Desktop mode unavailable ({exc}); falling back to the browser.")
+        _serve(open_browser=True)
+        return 0
+    desktop.run_desktop(app, reconnect=getattr(args, "reconnect", False))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

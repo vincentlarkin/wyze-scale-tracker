@@ -1,62 +1,68 @@
 # Wyze Scale Tracker (Local Web App)
 
-This app pulls your Wyze Scale records, stores them in a local SQLite database, and plots trends in a browser.
+Pulls every weigh-in from your Wyze scale — for **every person on the scale** — into a local SQLite database and charts trends in your browser.
 
 ## What it tracks
 
-- Weight (lb and kg)
-- BMI
-- Body fat
-- Muscle
-- Body water
-- Protein
-- Bone mineral
-- Visceral fat (`body_vfr`)
-- BMR
-- Metabolic age
+- Weight (lb and kg), BMI
+- Body fat, subcutaneous fat, visceral fat (`body_vfr`)
+- Muscle, skeletal muscle, protein, body water, bone mineral
+- BMR, metabolic age, body score (where the scale reports it)
 
-## Requirements
+Works with the original Wyze Scale, Scale S, Scale X, Scale Ultra and Ultra BodyScan.
 
-- Python 3.10+
-- Your Wyze account credentials
-- A Wyze `KEY_ID` and `API_KEY` from the Wyze API portal
-
-## Setup
-
-1. Create and activate a virtual environment.
-2. Install dependencies:
+## Quick start
 
 ```powershell
-python -m pip install -r requirements.txt
+py -3.13 -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt
+.venv\Scripts\python app.py
 ```
 
-3. Copy `.env.example` to `.env` and fill in your values.
-4. Start the app:
+A desktop window opens. On first boot a second **Connect Wyze** window opens on the Wyze developer console:
+
+1. Sign in with your Wyze email and password (type in the email code yourself if Wyze sends one).
+2. Click **Create API Key**. If you already have a key and the full API Key isn't shown, delete it and create a new one.
+3. As soon as the key appears, the window says **"API key captured — restarting in 3…"**, closes, logs in, and the dashboard pulls your history.
+
+The window only reads the email/password you submit on Wyze's own sign-in page and the key the console shows you; they're saved to `.env` on this computer and nothing goes anywhere but Wyze. If you sign in with Google/Apple (no Wyze password typed), the app keeps the key and asks for your Wyze password once. If Wyze asks for 2FA, the dashboard asks for the code.
+
+The app logs in **once**, caches a refreshable token in `data/wyze_session.json`, and refreshes it automatically; saved credentials let it silently re-login if the refresh token ever dies. To capture a new key later: click the Wyze chip → **Sign in with Wyze**, or run `python app.py desktop --reconnect`.
+
+Prefer your normal browser? `python app.py serve` runs the same dashboard at <http://127.0.0.1:8000> with a manual Connect form (paste Key ID + API Key from the [developer console](https://developer-api-console.wyze.com/#/apikey/view)).
+
+After that, opening the page auto-syncs if the last sync was more than 15 minutes ago.
+
+## CLI (for scripts, cron, and agents)
 
 ```powershell
-python app.py
+.venv\Scripts\python app.py              # desktop app (default)
+.venv\Scripts\python app.py desktop --reconnect  # re-capture an API key
+.venv\Scripts\python app.py serve      # web server + your browser (--no-browser to skip)
+.venv\Scripts\python app.py login        # connect from the terminal (handles 2FA)
+.venv\Scripts\python app.py sync         # pull new records for everyone
+.venv\Scripts\python app.py sync --full  # re-fetch complete history
+.venv\Scripts\python app.py status       # connection + per-person record counts
+.venv\Scripts\python app.py logout       # forget cached tokens
 ```
 
-5. Open [http://127.0.0.1:8000](http://127.0.0.1:8000).
+## How sync works
 
-## Usage
+- Lists your scales, then each scale's family members, and pulls records per person.
+- Incremental: each person is fetched from their newest stored record (2-day overlap). First sync pulls full history.
+- Records are de-duplicated by Wyze record ID, so re-syncing is safe.
+- The profile picker defaults to the person with the most records; pick **All Profiles** to see everyone.
 
-1. Click **Sync Now**.
-2. The app pulls records from Wyze and writes to `data/measurements.db`.
-3. If Wyze sync shows 0 records, click **Import Excel** and upload your Wyze export `.xlsx`.
-4. Use **Profile** to filter by person (Wyze profile ID for cloud records, sheet names for imported data).
-5. Use **Export CSV** and choose `day`, `week`, `year`, `all`, or `custom` date range.
-6. Use **Show Few** / **Show All Values** and column chips to customize the Recent Measurements table.
-7. Expand/collapse **Period Stats** as needed.
-8. Review the stats cards for average, highest, lowest, and change in the selected period.
-9. Check **matched-weight insights** to compare muscle/body-fat changes at roughly the same body weight (±1 lb).
-10. Use the chart controls to switch metrics and date range.
+## Other features
+
+- **Import Excel**: load a Wyze app `.xlsx` export (each worksheet becomes a profile).
+- **Export CSV**: day / week / year / all / custom range, per profile.
+- Period stats, matched-weight insights (muscle/body-fat change at the same weight ±1 lb), configurable table columns.
 
 ## Notes
 
-- Data is stored locally after sync.
-- Sync uses the reverse-engineered Wyze client (`wyze-sdk`) to fetch scale records.
-- Sync now includes a fallback mode that queries known scale models directly when `scales.list()` returns 0 devices.
-- `WYZE_SKIP_SCALE_LIST=true` (default) skips the fragile scale-list step and uses direct model queries first.
-- Imported exports are separated by worksheet name as profile identity.
-- If Wyze changes private endpoints, sync behavior can break until the client library is updated.
+- Requires Python 3.12+ (wyze-sdk 2.3.x).
+- Uses the unofficial [`wyze-sdk`](https://github.com/shauntarves/wyze-sdk); if Wyze changes private endpoints, sync can break until the library updates.
+- Wyze rate-limits the login endpoint (HTTP 429 after repeated attempts). Token caching means normal use logs in only once; if you do hit 429, wait 10–15 minutes.
+- Accounts created with Google/Apple sign-in need a Wyze password set in the app (Account → Security).
+- Everything stays local: `data/` (database + token) and `.env` are git-ignored.
