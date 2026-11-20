@@ -76,7 +76,8 @@ tracker/
   cli.py             command line
   desktop.py         pywebview shell + API-key capture window
   capture.js         script injected into the sign-in window
-templates/, static/  dashboard UI (Chart.js vendored in static/vendor)
+templates/, static/  dashboard UI (Chart.js vendored in static/vendor, app icon in static/icon.ico)
+tools/make_icon.py   regenerates the app icon (needs requirements-dev)
 tests/               pytest suite
 ```
 

@@ -13,6 +13,7 @@ import os
 import re
 import socket
 import ssl
+import sys
 import threading
 import time
 from datetime import datetime
@@ -207,9 +208,29 @@ class DesktopShell:
         if first_boot or reconnect:
             self.open_connect_window()
         try:
-            webview.start(private_mode=False, storage_path=str(config.data_dir() / "webview"))
+            webview.start(
+                private_mode=False,
+                storage_path=str(config.data_dir() / "webview"),
+                icon=str(ICON_PATH) if ICON_PATH.exists() else None,
+            )
         finally:
             self.server.shutdown()
+
+
+ICON_PATH = config.BASE_DIR / "static" / "icon.ico"
+APP_USER_MODEL_ID = "WyzeScaleTracker.Desktop"
+
+
+def set_windows_app_id() -> None:
+    """Give the process its own taskbar identity so Windows shows our icon, not python.exe's."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+    except Exception:
+        pass
 
 
 _cert_cache: dict[str, dict] = {}
@@ -255,5 +276,6 @@ def free_port(preferred: int) -> int:
 
 
 def run_desktop(flask_app, reconnect: bool = False) -> None:
+    set_windows_app_id()  # must happen before any window exists
     port = free_port(int(os.getenv("APP_PORT", "8000")))
     DesktopShell(flask_app, port).run(reconnect=reconnect)
