@@ -1,0 +1,24 @@
+[project]
+name = "wyze-scale-tracker"
+version = "2.0.0"
+description = "Sync Wyze scale readings for every family member into a local database and chart them."
+readme = "README.md"
+requires-python = ">=3.12"
+# Pinned versions live in requirements.txt / requirements-dev.txt.
+dependencies = ["flask", "python-dotenv", "wyze-sdk", "openpyxl", "pywebview", "keyring"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
